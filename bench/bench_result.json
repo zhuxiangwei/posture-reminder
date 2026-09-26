@@ -1,0 +1,32 @@
+[
+  {
+    "model": "lite",
+    "size_mb": 5.51,
+    "mean_ms": 18.8,
+    "p50_ms": 18.9,
+    "p95_ms": 20.2,
+    "fps": 53.1,
+    "detect_rate": "25/25",
+    "landmarks": 33
+  },
+  {
+    "model": "full",
+    "size_mb": 8.96,
+    "mean_ms": 21.8,
+    "p50_ms": 21.7,
+    "p95_ms": 22.7,
+    "fps": 45.9,
+    "detect_rate": "25/25",
+    "landmarks": 33
+  },
+  {
+    "model": "heavy",
+    "size_mb": 29.24,
+    "mean_ms": 46.6,
+    "p50_ms": 46.5,
+    "p95_ms": 48.2,
+    "fps": 21.4,
+    "detect_rate": "25/25",
+    "landmarks": 33
+  }
+]

@@ -1,0 +1,47 @@
+# 坐姿小卫士 · 运行依赖
+#
+# ⚠️ 两条关键约束，都是实测踩出来的，照抄下面的安装步骤能全部避开。
+#
+# ── 约束 1：必须用**系统 Python**（带 tkinter 的那个）
+#    WorkBuddy 自带的便携版 Python 3.13 不含 tkinter，`import tkinter` 直接失败。
+#    本项目界面用 PySide6（Qt，自带二进制，不依赖 tcl/tk），
+#    但环境仍然固定用系统 Python，避免以后再踩：
+#      C:\Users\tmpee\AppData\Local\Programs\Python\Python312\python.exe   (3.12.10, tk 8.6)
+#
+# ── 约束 2：mediapipe 必须 `--no-deps` 安装，并**跳过 opencv-contrib-python**
+#    mediapipe 声明依赖 opencv-contrib-python，而它与 opencv-python 同时提供 cv2。
+#    pip 替换时会删除 site-packages\cv2 下几千个文件 —— 在受限环境下会撞上
+#    批量删除护栏而中断安装。opencv-python 已经够用：
+#    已实测原生推理管线跑通（首次 17ms / 30 帧均值 15.2ms），不需要 contrib。
+#    pip 事后会报一条 "mediapipe requires opencv-contrib-python" 的提示，**可以忽略**。
+#
+# ── 安装步骤（照抄）
+#   <系统Python> -m venv envs\posture
+#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple opencv-python PySide6
+#   envs\posture\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple mediapipe
+#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple absl-py certifi sounddevice flatbuffers matplotlib
+#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pywin32   # 可选：重新生成语音时才需要
+#
+#   （国内直连 PyPI 会很慢甚至卡死，务必带 -i 走镜像）
+#
+# ── 实测版本（本机 Windows 10 / Python 3.12.10）
+
+# 界面
+PySide6==6.11.2                 # Qt 官方绑定；圆角大按钮 / 平滑中文都靠它
+
+# 推理
+mediapipe==1.0.1                # ⚠️ 1.0 已移除 mp.solutions，只能用 Tasks API
+opencv-python==5.0.0.93         # 只用来读摄像头和缩放预览图；不装 opencv-contrib
+numpy==2.5.3
+
+# mediapipe 的其余依赖（由 --no-deps 安装后手动补齐）
+absl-py==2.5.0
+certifi==2026.7.22
+sounddevice==0.5.6
+flatbuffers==25.12.19
+matplotlib==3.11.2
+
+# 语音片段生成（仅 tools/make_voice.py 需要，运行时播放不需要网络也不依赖它们）
+edge-tts==7.2.8                 # 微软神经语音，8 个中文；默认 zh-CN-XiaoyiNeural（最年轻）
+soundfile==0.14.0               # mp3→wav 转换（自带 libsndfile 1.2.2，支持 mp3 解码）
+pywin32==312                    # 备用引擎：win32com 直驱 SAPI5 出 wav（离线兜底）
