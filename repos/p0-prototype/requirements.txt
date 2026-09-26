@@ -1,12 +1,15 @@
 # 坐姿小卫士 · 运行依赖
 #
-# ⚠️ 两条关键约束，都是实测踩出来的，照抄下面的安装步骤能全部避开。
+# ⚠️ 三条关键约束，都是实测踩出来的，照抄下面的安装步骤能全部避开。
 #
-# ── 约束 1：必须用**系统 Python**（带 tkinter 的那个）
-#    WorkBuddy 自带的便携版 Python 3.13 不含 tkinter，`import tkinter` 直接失败。
-#    本项目界面用 PySide6（Qt，自带二进制，不依赖 tcl/tk），
-#    但环境仍然固定用系统 Python，避免以后再踩：
-#      C:\Users\tmpee\AppData\Local\Programs\Python\Python312\python.exe   (3.12.10, tk 8.6)
+# ── 约束 1：解释器用 Python 3.13（本项目**不需要** tkinter）
+#    早期界面用过 tkinter，才留下"必须用系统 Python 3.12（带 tk 8.6）"这条约束。
+#    现在界面是 PySide6（Qt 自带二进制，不依赖 tcl/tk），该约束随之作废：
+#    本机原 Python312 安装已不完整（只剩 Lib/Scripts/include，python.exe 不在），
+#    照旧文档走会直接失败。已实测 Python 3.13 全链路可用：
+#      C:\Users\zxw\.workbuddy\binaries\python\versions\3.13.12\python.exe
+#    三个 pin 在 3.13 上都有可用轮子：mediapipe=py3-none-win_amd64、
+#    opencv-python=cp37-abi3、PySide6=cp310-abi3、numpy 有 cp313。
 #
 # ── 约束 2：mediapipe 必须 `--no-deps` 安装，并**跳过 opencv-contrib-python**
 #    mediapipe 声明依赖 opencv-contrib-python，而它与 opencv-python 同时提供 cv2。
@@ -15,19 +18,31 @@
 #    已实测原生推理管线跑通（首次 17ms / 30 帧均值 15.2ms），不需要 contrib。
 #    pip 事后会报一条 "mediapipe requires opencv-contrib-python" 的提示，**可以忽略**。
 #
+# ── 约束 3：装 `PySide6-Essentials`，**不要**装 `PySide6` 元包
+#    原因见下方"界面"一节包注释（Addons 覆盖 Essentials 的既有文件，
+#    pip 连续 unlink 满 50 次即触发批量删除护栏、安装被中断）。
+#
 # ── 安装步骤（照抄）
-#   <系统Python> -m venv envs\posture
-#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple opencv-python PySide6
-#   envs\posture\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple mediapipe
-#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple absl-py certifi sounddevice flatbuffers matplotlib
+#   <Python 3.13> -m venv envs\posture
+#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple opencv-python==5.0.0.93 numpy==2.5.3 PySide6-Essentials==6.11.2
+#   envs\posture\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple mediapipe==1.0.1
+#   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://pypi.org/simple absl-py==2.5.0 certifi==2026.7.22 sounddevice==0.5.6 flatbuffers==25.12.19 matplotlib==3.11.2
 #   envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pywin32   # 可选：重新生成语音时才需要
 #
-#   （国内直连 PyPI 会很慢甚至卡死，务必带 -i 走镜像）
+#   ⚠️ 国内直连 PyPI 会很慢甚至卡死，务必带 `-i` 走镜像；
+#      但镜像上个别包（实测 opencv-python==5.0.0.93）会报 "from versions: none"，
+#      再加 `--extra-index-url https://pypi.org/simple` 让官方兜底即可。
 #
-# ── 实测版本（本机 Windows 10 / Python 3.12.10）
+# ── 实测版本（本机 Windows / Python 3.13.12；2026-09-26 重建并全链路验证）
 
 # 界面
-PySide6==6.11.2                 # Qt 官方绑定；圆角大按钮 / 平滑中文都靠它
+# ⚠️ 装 Essentials，**不要**装 PySide6 元包（会连带 PySide6-Addons）。
+#    原因：6.x 起 PySide6 拆成 Essentials + Addons 两个 wheel，两者都写进
+#    同一个 site-packages\PySide6\ 目录，Addons 覆盖 Essentials 既有文件时
+#    会让 pip 连续 os.unlink（pip 全文件唯一一处 unlink 就是这个覆盖分支），
+#    实测达 50 次即触发本机批量删除护栏、安装被 SystemExit 中断。
+#    本项目只用 QtWidgets / QtGui / QtCore，全在 Essentials 里（已实测导入通过）。
+PySide6-Essentials==6.11.2      # Qt 官方绑定；圆角大按钮 / 平滑中文都靠它
 
 # 推理
 mediapipe==1.0.1                # ⚠️ 1.0 已移除 mp.solutions，只能用 Tasks API

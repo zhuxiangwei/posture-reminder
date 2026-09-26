@@ -13,7 +13,7 @@
 
 | 模式 | 参数 | 测什么 | 适用 |
 |---|---|---|---|
-| **纯侧面**（当前采用） | `--side-only --camera N` | 头前倾 / 塌腰 / 低头 | 纸笔作业，笔记本侧放 |
+| **纯侧面**（当前采用） | `--side-only --camera N` | 头前倾 / 塌腰 / 低头 | 纸笔作业，摄像头侧放 |
 | 双机位 | `--camera N --camera2 M` | 上面三项 + 低头/歪头/歪肩/太近，并可融合判「含胸驼背」 | 有正 + 侧两颗摄像头 |
 
 ---
@@ -37,6 +37,10 @@
 
 实测这台笔记本：**1920×1080 物理屏开 150% 缩放 → Qt 的逻辑桌面只有 1280×720，
 可用高度仅 680**。窗口尺寸写死会直接超出屏幕（标题栏被顶出、底部按钮被任务栏压住）。
+
+> 📌 **本机实测（2026-09-26，`--screen`）**：逻辑桌面 **1920×1080**、可用区域 **1920×1032**、
+> 缩放 **2.00x** —— 高度充足，不会出现上面那种被压住的情况。下面这套自适应逻辑仍然保留，
+> 它是给"换到更小/更缩放的屏幕"兜底的。
 
 所以初始尺寸按 `availableGeometry()` 收敛，并用屏幕可用区域居中；最小尺寸设为 700×500。
 如果你在别的机器上看到窗口装不下，先跑这条查真实屏幕参数：
@@ -100,8 +104,10 @@ envs\posture\Scripts\python.exe posture_app.py --screen
 | 跑在哪 | 本机，秒级 | 训练平台，小时级 |
 
 存的是 480px 缩略图，且只有决策标签 —— 没有关键点真值，**不能用于训练**。
-（`review_keep_fullres` 这个开关可以为将来的模型微调另存原图，**默认关闭**：
-用户已明确决定只做调阈值、不做重训练。）
+（`review_keep_fullres` 控制是否为「提醒现场」另存一张**原图**。
+2026-09-26 按用户的"处处用最高清"**改成默认开启**：摄像头已是 1080p，
+留一张原图等于把"以后还能不能做模型微调"这个选项保住 —— 那些帧是回不来的。
+代价是原图也计入 `review_max_files`，可留存的条数会变少；想省空间就在界面上关掉。）
 
 **隐私**：全部存本机 `review\` 目录、不上传；上限默认 300 条（超出自动删最旧的，
 且优先删未审核的，保证标注不丢）；「审核判定」页有**一键清空**。
@@ -140,7 +146,7 @@ envs\posture\Scripts\python.exe posture_app.py --screen
 ```bash
 # 0) 环境
 python -m venv envs\posture
-envs\posture\Scripts\python.exe -m pip install mediapipe opencv-python
+envs\posture\Scripts\python.exe -m pip install opencv-python==5.0.0.93 numpy==2.5.3 PySide6-Essentials==6.11.2   # 完整步骤与理由见 requirements.txt
 
 # 1) 排查第一步：看系统认到了几颗摄像头
 envs\posture\Scripts\python.exe posture_monitor.py --list-cameras
@@ -148,7 +154,7 @@ envs\posture\Scripts\python.exe posture_monitor.py --list-cameras
 # 2) 性能自测 —— 必须让一个人坐在摄像头前，否则数字偏乐观 40%
 envs\posture\Scripts\python.exe posture_monitor.py --bench --bench-frames 100
 
-# 3) 纯侧面试跑（⚠️ 笔记本要垫高到孩子头部高度：1.0~1.1m）
+# 3) 纯侧面试跑（⚠️ 摄像头要垫高到孩子头部高度：1.0~1.1m）
 envs\posture\Scripts\python.exe posture_monitor.py --side-only --camera 0 --calib 10
 
 # 4) 双机位（有第二颗摄像头时）
@@ -173,6 +179,7 @@ envs\posture\Scripts\python.exe posture_monitor.py --camera 0 --camera2 1 --cali
 | `--calib 10` | 标定时长（秒） |
 | `--model pose_landmarker_full.task` | 换更高精度档位（一般不需要） |
 | `--no-window` | 不开预览窗（长期挂机） |
+| **`--video 录像.mp4`** | **离线复现判定**：不接摄像头，把一段录像跑完整条判定链并输出逐条时间线（配 `--calib` 用录像前段标定，`--calib 0` 则用现有 baseline.json）。**跑得比真实播放快，且结果可复现** |
 
 ---
 
@@ -182,7 +189,7 @@ envs\posture\Scripts\python.exe posture_monitor.py --camera 0 --camera2 1 --cali
 python tests/test_offline.py
 ```
 
-用合成关键点回归判定逻辑，**88 个用例**，改代码后先跑这个：
+用合成关键点回归判定逻辑，**103 个用例**，改代码后先跑这个：
 
 | 组 | 覆盖 |
 |---|---|
@@ -195,7 +202,7 @@ python tests/test_offline.py
 | G | **阈值建议**（人工审核样本 → 建议阈值，含"误报权重更高"） |
 | H | **坐正了不发声**（源码级锁：这条约束没有摄像头没法做行为测试） |
 
-界面另有一套冒烟自检（16 项，含审核存图标注闭环、坐正不发声的行为验证），不需要摄像头：
+界面另有一套冒烟自检（17 项，含审核存图标注闭环、坐正不发声的行为验证），不需要摄像头：
 
 ```bash
 envs\posture\Scripts\python.exe posture_app.py --selftest
@@ -239,7 +246,6 @@ envs\posture\Scripts\python.exe posture_app.py --selftest
 | 歪头 / 歪肩 | ✅ | ❌ | ❌ 已放弃 |
 | 距离过近 | ✅ | ❌ | ❌ 纸笔场景不适用 |
 | 含胸驼背（两路互证） | ❌ | ❌ | ❌ 需双机位 |
-| 握笔姿势 | ❌ | ❌ | ❌ 需 DWPose 类模型 |
 
 **为什么正面测不出驼背**：正面视角下「前后方向」被压扁成几乎没有信息，
 这不是模型好坏问题，是几何决定的。必须靠侧面机位。
@@ -321,7 +327,8 @@ envs\posture\Scripts\python.exe tools\make_voice.py --list          # 看有哪�
 | **摄像头高度** | 放桌面时摄像头约 90~97cm，孩子眼睛 100~115cm，属轻度仰拍（5~10°）。**垫高 10~20cm** 更稳，也让髋部更容易入画（塌腰判定需要） |
 | 侧向机位别用 45° | 45° 只能看到前后位移的 71%；纯侧面模式请摆 80~90° |
 | 儿童关键点抖动 | 通用模型按成人训练，儿童头身比不同。缓解靠个人基线；根治要靠模型微调 |
-| 摄像头后端 | ⚠️ **实测 DSHOW 可能枚举不到设备，只有 MSMF 能打开**。程序已自动依次尝试 |
+| 摄像头后端 | ⚠️ **实测：本机 USB 摄像头（Nebula 02）只有 MSMF / ANY 能打开，DSHOW 按索引 0~3 全部失败**；而笔记本时代恰好相反（DSHOW 可用、MSMF 报错）。**两端结论相反，所以程序只能依次尝试，不能写死**。程序已自动按 DSHOW → MSMF → ANY 试 |
+| 摄像头分辨率 | ⚠️ 本机这颗 USB 摄像头**固定 1920×1080 @30fps，不接受降分辨率请求**（实测请求 640×480 / 1280×720 / 1920×1080 读回来都是 1080p）。所以**默认采集值已改为最高档 1080p**，让代码与实际一致。实测代价：1080p 比 720p 每帧只慢 **7.8%（VIDEO 模式 11.4 vs 10.5ms）**，5 FPS 下只占预算 5.7% —— 可以放心用最高档 |
 | 只需 5 FPS | 采样率默认 5 FPS 是**刻意的**。坐姿变化是秒级慢过程，调高只会白耗电 |
 | 判定靠相对基线 | 阈值随体型/机位/镜头变化，**绝对值不可靠，相对个人基线的偏移才可靠** |
 | 暗光敏感 | 光线是影响准确率最大的外部因素，晚上必须开台灯；侧放后注意别变成侧逆光 |
@@ -338,9 +345,10 @@ envs\posture\Scripts\python.exe tools\make_voice.py --list          # 看有哪�
 | `posture_monitor.py` | **判定逻辑 + CLI**。指标计算、判定、迟滞闸（ReminderGate）、融合、标定自检、bench |
 | `posture_engine.py` | **运行时引擎（线程化）**。采集→推理→判定→迟滞→语音，对界面暴露快照与指令 |
 | `posture_app.py` | **PySide6 图形界面**。只画界面，不碰摄像头/推理 |
-| `tests/test_offline.py` | 60 个离线回归用例（不需要摄像头和依赖） |
+| `tests/test_offline.py` | **103 个离线回归用例**（不需要摄像头和依赖） |
 | `config.json` | 家长设置（自动生成） |
 | `baseline.json` | 个人基线（自动生成，跟着机位走） |
+| `logs/run-YYYYMMDD.log` | 运行日志（自动生成，纯文本，保留最近 7 天；`--no-log` 可关） |
 | `review\pending\` `review\done\` | 判定现场图 + 指标 + 家长标注（自动生成，本地，可一键清空） |
 
 ### 关键函数
@@ -360,6 +368,9 @@ envs\posture\Scripts\python.exe tools\make_voice.py --list          # 看有哪�
 | **`ReviewStore`** | 判定现场图 + 指标 + 家长标注的本地存储（上限剪枝 / 一键清空 / 隐私） |
 | `PostureEngine` | 后台线程引擎；`snapshot()/pause()/resume()/recalibrate()/stop()` |
 | `Speaker` | 语音播放。**播放跑在独立线程**，`say()` 只入队（实测 0.18ms 返回）；队列深度 1，新提醒顶掉旧的 |
+| **`VideoSource` / `replay()`** | **把录像当摄像头**，离线重跑整条判定链（标定→指标→判定→迟滞→提醒）并输出逐条时间线（`--video`）。只换帧来源，规则仍是同一份实现 |
+| `RunLog` | 运行日志落盘：按天一个文件、保留最近 7 天；**写失败静默降级**，绝不影响提醒主功能 |
+| `_shrink()` | 缩图（960px 宽），**界面预览与审核缩略图共用**。它**不参与判定**（判定用原始帧）；审核原图另走 `full_frame`。注意 `PREVIEW_MAX_W` 一改，审核缩略图的分辨率也跟着变 |
 
 **迟滞由 `ReminderGate` 统一实现**：单帧越界绝不报警，需连续超标 `SUSTAIN_SEC`(4s) 才提醒；
 恢复正常需持续 `CLEAR_SEC`(3s) 才解除。
@@ -431,7 +442,4 @@ envs\posture\Scripts\python.exe tools\make_voice.py --list          # 看有哪�
 | `01-research-report.md` | 调研报告（阈值依据、儿童场景研究） |
 | `02-deployment-taskbook.md` | 部署任务书 |
 | `03-side-only-plan.md` | **纯侧面方案 + 图形界面 + 审核标定**（当前主方案） |
-| `04-pen-grip-feasibility.md` | **握笔姿势检测可行性评估**（结论：得独立成软件 + 独立摄像头） |
-
-工具：`tools/check_hand_view.py` —— 握笔视角验证（先确认看得见，再谈判得准）
 

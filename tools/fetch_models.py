@@ -4,12 +4,12 @@
 下载 MediaPipe 模型权重
 =======================
 
-模型文件共约 51MB（heavy 档单个就 29MB），不适合塞进 git 仓库
+模型文件共约 44MB（heavy 档单个就 29MB），不适合塞进 git 仓库
 （GitHub 单文件上限 100MB、超 50MB 会警告，而且会永久拖大仓库体积）。
 所以仓库里不存模型，用这个脚本按需下载。
 
-    python tools/fetch_models.py              # 只下运行必需的（lite + hand）
-    python tools/fetch_models.py --all        # 全下（含 full / heavy，约 51MB）
+    python tools/fetch_models.py              # 只下运行必需的（lite）
+    python tools/fetch_models.py --all        # 全下（含 full / heavy，约 44MB）
     python tools/fetch_models.py --list       # 看看有哪些、下没下
 
 ⚠️ 一个必须处理的坑
@@ -43,14 +43,12 @@ BASE = "https://storage.googleapis.com/mediapipe-models"
 
 # 档位名在 URL 里出现两次，这里用模板拼，避免手写出错
 POSE_URL = BASE + "/pose_landmarker/pose_landmarker_{k}/float16/1/pose_landmarker_{k}.task"
-HAND_URL = BASE + "/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 
 MODELS = {
     # 文件名                          URL                                                   必需  大致大小
     "pose_landmarker_lite.task": (POSE_URL.format(k="lite"), True, 5.5),
     "pose_landmarker_full.task": (POSE_URL.format(k="full"), False, 9.0),
     "pose_landmarker_heavy.task": (POSE_URL.format(k="heavy"), False, 29.2),
-    "hand_landmarker.task": (HAND_URL, True, 7.5),   # 只用握笔可行性验证工具需要
 }
 
 MIN_BYTES = 1 * 1024 * 1024      # 最小的模型也有 5MB，低于 1MB 一定是错误页

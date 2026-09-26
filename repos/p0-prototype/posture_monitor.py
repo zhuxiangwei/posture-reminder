@@ -8,14 +8,15 @@
 
 两种模式
 --------
-1) **纯侧面**（`--side-only`，纸笔作业场景推荐）
-   笔记本侧放到孩子侧方，只用一颗摄像头。测：头前倾、塌腰、低头（头下探）。
+1) **纯侧面**（`--side-only`，纸笔作业场景推荐，**本机当前采用**）
+   摄像头侧放到孩子侧方 80~90°，只用一颗。本机只接了一颗 USB 摄像头，索引 0。
+   测：头前倾、塌腰、低头（头下探）。
    放弃：歪头 / 歪肩（冠状面，侧面原理上测不到）、「含胸驼背」融合升级项。
    详见 docs/03-side-only-plan.md。
 
-2) **双机位**（默认，需两颗摄像头）
-   正面 = 内置头：低头 / 歪头 / 歪肩 / 距离过近。
-   侧面 = 外接头：头前倾 / 塌腰。
+2) **双机位**（需两颗摄像头；本机只有一颗，暂不可用）
+   正面机位：低头 / 歪头 / 歪肩 / 距离过近。
+   侧面机位：头前倾 / 塌腰。
    两路互证时升级判为「含胸驼背」——这是单路做不到的。
 
 三条设计约束（见 docs/01-research-report.md）
@@ -45,6 +46,7 @@
 """
 
 import argparse
+import json
 import math
 import os
 import statistics
@@ -148,14 +150,20 @@ L_EAR, R_EAR = 7, 8
 L_SH, R_SH = 11, 12
 L_HIP, R_HIP = 23, 24
 
-# ⚠️ 采集分辨率必须显式设置。
-# 实测（HP EliteBook 835 G8 内置 HP HD Camera，标称 720p）：
-#   不设 CAP_PROP_FRAME_WIDTH/HEIGHT 时，OpenCV 默认只给 **640x480**，
-#   而报告 §3 已实测「推理耗时几乎不受输入分辨率影响」（MediaPipe 内部会缩放到固定尺寸）。
-#   也就是说：把分辨率拉到 720p 是**纯赚的精度**，不额外花时间。
-#   640x480 在 1~1.5m 机位下头肩太小，关键点会明显抖 —— 这个坑不设就会踩。
-DEFAULT_CAM_W = 1280
-DEFAULT_CAM_H = 720
+# ⚠️ 采集分辨率：默认取**摄像头能给的最高档 1920x1080**。
+#   两台机器实测行为不同，两个知识点都留在这：
+#   ① 本机 USB 摄像头 Nebula 02（VID_3AAE&PID_6373）**只输出 1920x1080 @30fps**，
+#      请求 640x480 / 1280x720 / 1920x1080 读回来**都是 1080p**（2026-09-26 实测 10 组组合）。
+#      → 本机怎么设都在用最高档；默认取 1080p 是为了**让代码与实际一致**，
+#        避免"请求 720p 却拿到 1080p"这种看不出来的隐性偏差。
+#   ② 笔记本 HP HD Camera（标称 720p）：**不设时 OpenCV 只给 640x480**，
+#      640x480 在 1~1.5m 机位下头肩太小、关键点会抖 —— 所以必须显式设。
+#   取最高档的代价已实测（同一帧受控 A/B，同分辨率对照组漂移 ≤0.9%）：
+#      VIDEO 模式（程序真实模式）：1920x1080 ≈ 11.4ms  vs  1280x720 ≈ 10.5ms → 慢 7.8%
+#      IMAGE 模式（每帧全图检测）：1920x1080 ≈ 20.7ms  vs  1280x720 ≈ 19.4ms → 慢 6.5%
+#   5 FPS 的每帧预算是 200ms，1080p 只占 5.7% → **代价可忽略，最高档可以放心用**。
+DEFAULT_CAM_W = 1920
+DEFAULT_CAM_H = 1080
 
 
 def find_model(name=DEFAULT_MODEL):
@@ -173,8 +181,11 @@ def find_model(name=DEFAULT_MODEL):
 
 
 # ⚠️ 后端必须挨个试，不能写死。
-# 实测（2026-09-22，本机 + Nebula 02 USB 摄像头 1080p / HP 内置头）：
+# 实测（2026-09-22，本机 + Nebula 02 USB 摄像头 / HP 内置头）：
 #   DSHOW 后端**一个设备都枚举不到**，只有 MSMF 能打开同一颗摄像头。
+# 复测（2026-09-26，本机只接 USB Nebula 02，VID_3AAE&PID_6373）：
+#   结论不变 —— DSHOW 按索引 0~3 全部 open 失败（"can't be used to capture by index"），
+#   MSMF / ANY 索引 0 可用，固定 1920x1080 @30fps。
 # 写死单一后端会得到"这台机器没有摄像头"的假结论——这个坑踩过一次。
 BACKENDS = []
 
@@ -215,7 +226,9 @@ def open_camera(idx=None, backend=None, width=None, height=None):
       - 索引：接多个摄像头时 0 未必是想要的那颗
       - 后端：DSHOW 与 MSMF 能看到的设备集合可能完全不同（实测差异极大）
       - 分辨率：不显式设置时 OpenCV 往往只给 640x480；但**有些后端设了反而打不开流**
-        （实测本机 MSMF 报 "Failed to select stream 0"，DSHOW 则正常给到 720p）
+        （两端实测结论相反：笔记本上 MSMF 报 "Failed to select stream 0"、DSHOW 正常给 720p；
+         本机 USB Nebula 02 恰相反 —— DSHOW 完全打不开、MSMF 固定给 1080p。
+         所以只能挨个组合试，不能写死。）
     所以先按请求分辨率试一轮，全失败再退到"不设分辨率"兜底一轮。
     """
     _need_cv()
@@ -1082,6 +1095,203 @@ def print_sanity(tags, bases):
     print("  提示：数值明显超出区间 -> 孩子标定时就没坐正，或机位/光照有问题，重新标。")
 
 
+# ---------------------------------------------------------------- 视频回放（离线复现判定）
+
+class VideoSource:
+    """把视频文件伪装成摄像头对象（接口与 cv2.VideoCapture 一致）。
+
+    ⚠️ 它只换掉「帧从哪来」。**判定规则仍是同一份实现**
+       （`compute_side_metrics` / `judge_side` / `ReminderGate` / `SIDE_THRESHOLDS`），
+       所以回放出来的时间线与实跑一致 —— 这正是当初把规则从界面里抽出来的原因。
+    """
+
+    def __init__(self, path):
+        if cv2 is None:
+            sys.exit("缺少 opencv（cv2），无法回放视频。")
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            sys.exit(f"打不开视频文件：{path}")
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 0.0
+        self.fps = fps if 1.0 <= fps <= 240.0 else 30.0     # 有些容器报 0/NaN
+        self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.i = 0
+
+    # ---- 与 VideoCapture 兼容的最小接口（read_frame / grab 都能直接用）
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def read(self):
+        ok, frame = self.cap.read()
+        if ok:
+            self.i += 1
+        return ok, frame
+
+    def release(self):
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+    def set(self, *_a):
+        return False                    # 文件没有"设分辨率"这回事
+
+    def get(self, prop):
+        return self.cap.get(prop)
+
+    @property
+    def vtime(self):
+        """已读帧对应的**视频内时间**（秒）。回放的时间轴用它，不用墙上时钟。"""
+        return self.i / self.fps
+
+    @property
+    def duration(self):
+        return (self.frames / self.fps) if self.frames else 0.0
+
+
+def _mmss(t):
+    return f"{int(t // 60):02d}:{t % 60:04.1f}"
+
+
+def _fmt_metrics(m, b):
+    """把当前指标与基线并排打出来，方便一眼看出"差多少才越界"。"""
+    parts = []
+    for k in ("neck_angle", "trunk_angle"):
+        v = m.get(k)
+        if v is None:
+            continue
+        bv = b.get(k)
+        parts.append(f"{k}={v:.1f}°" + (f"(基线 {bv:.1f})" if bv is not None else ""))
+    v = m.get("sh_ear_len")
+    if v is not None and b.get("sh_ear_len"):
+        parts.append(f"肩耳距={v:.0f}(基线 {b['sh_ear_len']:.0f})")
+    return "  ".join(parts)
+
+
+def _load_baseline_json():
+    """读 baseline.json 里的 base 字段（与界面共用同一份基线，不含"壳"）。"""
+    p = os.path.join(HERE, "baseline.json")
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f).get("base") or None
+    except Exception:
+        return None
+
+
+def replay(args):
+    """离线回放一段视频，跑完整判定链并输出逐条时间线。
+
+    为什么要有它：判定准不准（误报/漏报）以前只能"当场盯着看"。
+    现在录一段视频就能离线重跑整条链路 —— **不占人在场的时间，而且可复现**
+    （同一视频 + 同一阈值 → 同一时间线），用来调阈值比看回放录像快得多。
+
+    用法：
+        python posture_monitor.py --video rec.mp4 --calib 10   # 用视频前 10 秒标定
+        python posture_monitor.py --video rec.mp4 --calib 0    # 用现有 baseline.json
+
+    时间基准是**视频内时间**，不 sleep、不开窗，所以跑得比真实播放快很多。
+    """
+    _need_cv()
+    _need_mp()
+
+    if args.camera2 is not None:
+        sys.exit("[回放] --video 目前只支持纯侧面一路（判定规则与 --side-only 相同）；"
+                 "请去掉 --camera2。")
+
+    global SIDE_YAW_DEG
+    SIDE_YAW_DEG = args.side_yaw
+
+    src = VideoSource(args.video)
+    print(f"[回放] {args.video}")
+    print(f"        {src.frames} 帧 · {src.fps:.1f} FPS · 时长 {src.duration:.1f}s")
+    lm = make_landmarker(find_model(args.model))
+    step = max(1, int(round(src.fps / max(1, int(FPS_SAMPLE)))))   # 每 N 帧判定一次
+
+    try:
+        # ---------------- 标定：用视频前 calib 秒，或直接用现有 baseline
+        if args.calib and args.calib > 0:
+            t_end = min(src.duration, float(args.calib))
+            samples = []
+            while src.i < src.frames and src.vtime < t_end:
+                if src.i % step != 0:
+                    if not src.read()[0]:
+                        break
+                    continue
+                fr, m, _ = grab(src, lm, src.vtime, compute_side_metrics)
+                if fr is None:
+                    break
+                if m:
+                    samples.append(m)
+            if len(samples) < 10:
+                sys.exit(f"[回放] 标定失败：前 {t_end:.0f}s 只采到 {len(samples)} 个有效样本。\n"
+                         f"       检查这段视频里是否有人、光线是否够、机位是否侧面；\n"
+                         f"       或改用 --calib 0（走已有的 baseline.json）。")
+            base = build_baseline(samples)
+            print(f"[回放] 前 {t_end:.0f}s 标定基线：" +
+                  ", ".join(f"{k}={v:.2f}" for k, v in sorted(base.items())))
+        else:
+            base = _load_baseline_json()
+            if not base:
+                sys.exit("[回放] --calib 0 需要 baseline.json：先用界面标定一次，或改回 --calib 10。")
+            print("[回放] 使用现有 baseline.json：" +
+                  ", ".join(f"{k}={v:.2f}" for k, v in sorted(base.items())))
+
+        # ---------------- 回放判定（迟滞与提醒间隔仍然走共用 ReminderGate）
+        gate = ReminderGate()
+        fired, counts = [], {}
+        n_judge = n_skip = 0
+        prev = []
+        print("\n---- 判定时间线 ----")
+        while src.i < src.frames - 1:
+            if src.i % step != 0:
+                if not src.read()[0]:
+                    break
+                continue
+            t = src.vtime
+            fr, m, _ = grab(src, lm, t, compute_side_metrics)
+            if fr is None:
+                break
+            if m is None:
+                n_skip += 1
+                continue
+            n_judge += 1
+            issues = judge_side(m, base)
+            for it in issues:
+                counts[it] = counts.get(it, 0) + 1
+            st = gate.update(issues, t)
+            if issues and issues != prev:
+                print(f"[{_mmss(t)}] 判定 → {'/'.join(issues)}    {_fmt_metrics(m, base)}")
+            elif not issues and prev:
+                print(f"[{_mmss(t)}] 恢复 → 坐姿良好")
+            prev = list(issues)
+            if st.fire:
+                print(f"[{_mmss(t)}] ▶ 提醒「{st.fire}」")
+                fired.append((t, st.fire))
+
+        # ---------------- 汇总
+        dur = max(1e-6, src.duration)
+        print("\n---- 汇总 ----")
+        print(f"  时长        {_mmss(src.duration)}")
+        extra = f"（另有 {n_skip} 帧未检测到人，已跳过）" if n_skip else ""
+        print(f"  判定帧      {n_judge} 帧（每 {step} 帧取 1 帧）{extra}")
+        if fired:
+            print(f"  提醒        {len(fired)} 次 / {dur / 60:.1f} 分钟"
+                  f" → 平均每 {dur / len(fired):.0f} 秒一次")
+        else:
+            print("  提醒        0 次")
+        if counts:
+            for it, c in sorted(counts.items(), key=lambda x: -x[1]):
+                print(f"  问题「{it}」  命中 {c} 个判定帧")
+        else:
+            print("  问题        没有任何问题命中（是全片都坐得好，还是阈值太松？）")
+        print("\n  提示：误报看上面「判定 →」的行与录像是否对得上；"
+              "漏报要看有没有该提醒却没出现「▶ 提醒」的片段。")
+        return 0
+    finally:
+        src.release()
+
+
 # ---------------------------------------------------------------- 入口
 
 def build_parser():
@@ -1094,6 +1304,7 @@ def build_parser():
             "  双机位                  --camera 0 --camera2 1 --calib 10\n"
             "  性能自测（需真人入画）  --bench --bench-frames 100\n"
             "  排查摄像头              --list-cameras\n"
+            "  离线复现判定            --video 录像.mp4 --calib 10\n"
         ),
     )
     ap.add_argument("--bench", action="store_true", help="只测推理性能")
@@ -1111,11 +1322,13 @@ def build_parser():
     ap.add_argument("--backend", choices=["DSHOW", "MSMF", "ANY"], default=None,
                     help="强制指定采集后端；默认按 DSHOW->MSMF->ANY 依次尝试")
     ap.add_argument("--width", type=int, default=DEFAULT_CAM_W,
-                    help=f"采集宽度，默认 {DEFAULT_CAM_W}（不设会掉到 640x480）")
+                    help=f"采集宽度，默认 {DEFAULT_CAM_W}（最高清档；本机摄像头固定给 1080p，改小无效）")
     ap.add_argument("--height", type=int, default=DEFAULT_CAM_H,
                     help=f"采集高度，默认 {DEFAULT_CAM_H}")
     ap.add_argument("--calib", type=float, default=10.0, help="标定时长（秒）")
     ap.add_argument("--no-window", action="store_true", help="不开预览窗")
+    ap.add_argument("--video", default=None,
+                    help="离线回放：给定视频文件，跑完整判定链并输出逐条时间线（不接摄像头）")
     return ap
 
 
@@ -1125,5 +1338,7 @@ if __name__ == "__main__":
         list_cameras(_args.width, _args.height)
     elif _args.bench:
         bench(_args)
+    elif _args.video:
+        sys.exit(replay(_args))
     else:
         main(_args)

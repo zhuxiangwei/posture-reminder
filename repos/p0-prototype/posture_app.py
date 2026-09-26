@@ -185,12 +185,15 @@ class FaceWidget(QWidget):
 class PostureApp(QWidget):
     POLL_MS = 150
 
-    def __init__(self, demo=False, autostart=True):
+    def __init__(self, demo=False, autostart=True, log_path=None, log_enabled=True):
         super().__init__()
         self.demo = demo
         self.engine = None
         self._demo_speaker = None
         self._log_lines = []
+        # 运行日志同时落盘：GUI 里那份只活在内存（关掉就没了），
+        # 出了问题只能靠人复述。落盘后把 logs\run-*.log 发过来即可查。
+        self.runlog = pe.RunLog(log_path, enabled=log_enabled)
         self._demo_stats = pe.PostureEngine._blank_stats()
         self._demo_i = 0
 
@@ -429,6 +432,7 @@ class PostureApp(QWidget):
         self._log_lines.append(line)
         del self._log_lines[:-300]
         print(line)
+        self.runlog.write(line)         # 落盘失败会被吞掉，不影响主流程
         for w in self.findChildren(QTextEdit):
             if w.objectName() == "logwin":
                 w.append(line)
@@ -982,7 +986,7 @@ class ParentDialog(QDialog):
         p1.layout().addLayout(f1)
         f1.setSpacing(10)
         for key, label, kind, hint in (
-                ("camera", "摄像头索引", int, "内置摄像头一般是 0。命令行加 --list-cameras 可查"),
+                ("camera", "摄像头索引", int, "本机只接了一颗 USB 摄像头，填 0；接多颗时用 --list-cameras 查"),
                 ("side_yaw", "机位偏航角（度）", float, "0=正对，90=正侧。纯侧面建议 80~90，别用 45"),
                 ("calib_sec", "标定时长（秒）", float, "孩子端坐保持多久来采集基线"),
                 ("fps_sample", "采样帧率", int, "5 就够。坐姿是秒级慢过程，调高只白耗电")):
@@ -1072,7 +1076,7 @@ class ParentDialog(QDialog):
             "看「颈部前倾角摆幅」涨到多少。\n\n"
             "⚠️ 如果摆幅很小（<5°），说明摄像头太正对孩子了 —— "
             "正面视角下同侧的耳和肩几乎在一条竖直线上，前后关系被压扁，"
-            "程序<b>不会报错，而是静默失效</b>。把笔记本往侧面转，机位摆到 80~90° 正侧。\n\n"
+            "程序<b>不会报错，而是静默失效</b>。把摄像头转向孩子侧面，机位摆到 80~90° 正侧。\n\n"
             "判据用「摆幅」而不是「和基线的差值」，所以**不用等标定完成**就能验机位。")
         info.setWordWrap(True)
         info.setTextFormat(Qt.RichText)
@@ -1146,6 +1150,13 @@ class ParentDialog(QDialog):
 
         # --- 页7 日志 ---
         p7 = self._tab_scroll(tabs, "运行日志")
+        self.runlog_tip = QLabel()
+        self.runlog_tip.setObjectName("hint")
+        self.runlog_tip.setWordWrap(True)
+        self.runlog_tip.setText(
+            f"日志文件：{parent.runlog.path}" if parent.runlog.path
+            else "本次未写日志文件（--no-log，或日志目录不可写）。")
+        p7.layout().addWidget(self.runlog_tip)
         self.logwin = QTextEdit()
         self.logwin.setObjectName("logwin")
         self.logwin.setReadOnly(True)
@@ -1309,7 +1320,7 @@ class ParentDialog(QDialog):
                               "灵敏度会明显更好。", "#B4701A")
         else:
             self._set_verdict(f"❌ 摆幅只有 {swing:.1f}° —— 摄像头太正对孩子了。"
-                              "请把笔记本往孩子侧面转，机位摆到 80~90° 正侧。"
+                              "请把摄像头转向孩子侧面，机位摆到 80~90° 正侧。"
                               "（若还没让孩子前伸过，先让他前伸一下再看。）", "#B4701A")
 
     def _refresh_sanity(self):
@@ -1553,6 +1564,9 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="只构建界面并退出（离屏冒烟测试）")
     ap.add_argument("--screen", action="store_true",
                     help="打印屏幕参数（逻辑尺寸/可用区域/缩放）后退出，不显示窗口")
+    ap.add_argument("--log-file", default=None,
+                    help="运行日志文件路径（默认 logs\\run-YYYYMMDD.log，按天一个，保留 7 天）")
+    ap.add_argument("--no-log", action="store_true", help="不写运行日志文件")
     args = ap.parse_args()
 
     if args.screen:
@@ -1583,7 +1597,8 @@ def main():
             print(f"屏幕：可用区域 {av.width()}x{av.height()}（逻辑像素），"
                   f"缩放 {scr.devicePixelRatio():.2f}")
 
-    win = PostureApp(demo=args.demo, autostart=not args.selftest)
+    win = PostureApp(demo=args.demo, autostart=not args.selftest,
+                     log_path=args.log_file, log_enabled=not args.no_log)
     win.show()
     if args.selftest:
         print(f"窗口：{win.width()}x{win.height()}  "

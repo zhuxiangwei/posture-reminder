@@ -13,11 +13,9 @@
 `Updates were rejected... fetch first`。脚本会识别这种情况并给出两个选项，
 让你自己选（而不是替你 force push 覆盖掉远端的东西）。
 
-用法：
-    python tools/push_to_github.py            # 推
-    python tools/push_to_github.py --check    # 只看状态，不动手
-
-也可以直接双击项目根目录的「推送到GitHub.bat」。
+用法（只用标准库，项目环境或系统 Python 都可以）：
+    envs\posture\Scripts\python.exe tools\push_to_github.py            # 推
+    envs\posture\Scripts\python.exe tools\push_to_github.py --check    # 只看状态，不动手
 """
 import argparse
 import os

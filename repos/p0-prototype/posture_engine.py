@@ -67,10 +67,12 @@ DEFAULT_CONFIG = {
     "review_enabled": True,        # 全部本地存储、不上传；家长可一键清空
     "review_max_files": 300,       # 超出上限自动删最旧的
     "review_sample_sec": 180.0,    # 每隔多久另存一张"判为良好"的抽样（否则测不出漏报）
-    # 2026-09-22 用户明确决定：**只做调阈值，不做模型重训练**。
-    # 所以原图默认不存（少占 6~8 倍空间、也少留影像）；开关保留，
-    # 将来若要走 P3（儿童专用模型微调）再打开 —— 那些帧是回不来的，只能提前存。
-    "review_keep_fullres": False,
+    # 2026-09-26 用户改口径：摄像头换了高清、并要求**处处都用最高清档**，
+    # 所以「提醒现场」的原图**默认就存**（原来为了省空间是关的）。
+    # 代价：1080p 原图每张约 150~500KB；且 `_full.jpg` 也计入 review_max_files，
+    #       所以实际能留存的**条数**会变少（想省空间就在「家长设置 → 审核判定」关掉）。
+    # 剪枝/清空会把原图和缩略图一起处理（见 _files_of），不会留孤儿文件。
+    "review_keep_fullres": True,
 }
 
 # 给孩子看的文案：温和、非命令式，而且**不用红色**。
@@ -975,8 +977,80 @@ class PostureEngine(threading.Thread):
         self._log("监测已停止")
 
 
-def _shrink(frame, max_w=480):
-    """把帧缩到界面用的小图。不缩的话 UI 每帧要搬 1280x720，纯属浪费。"""
+# ---------------------------------------------------------------- 运行日志落盘
+
+class RunLog:
+    """把界面/引擎的运行日志同时写到磁盘。
+
+    为什么要它：GUI 的「运行日志」页只活在内存里（上限 300 行），程序一关就没了 ——
+    出了问题只能靠人复述"当时显示了什么"。留一份文件，复测/排障时直接把当天的
+    `logs\\run-YYYYMMDD.log` 发过来，就能看到完整时间线。
+
+    规则：
+      · 默认 `logs/run-YYYYMMDD.log`（按天一个文件；`--log-file` 可改路径）
+      · 只保留最近 KEEP_DAYS 天，启动时清一次
+      · **任何异常都被吞掉** —— 记日志失败绝不能拖垮提醒主功能
+      · `enabled=False`（`--no-log`）时完全不动磁盘
+    """
+
+    KEEP_DAYS = 7
+
+    def __init__(self, path=None, enabled=True):
+        self.enabled = bool(enabled)
+        self.path = None
+        if not self.enabled:
+            return
+        try:
+            p = path or os.path.join(HERE, "logs", time.strftime("run-%Y%m%d.log"))
+            # 给的是目录也接受（末尾斜杠或已存在的目录）
+            if p.endswith((os.sep, "/")) or os.path.isdir(p):
+                p = os.path.join(p, time.strftime("run-%Y%m%d.log"))
+            self.path = os.path.abspath(p)
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write("\n===== 启动 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            self._prune()
+        except Exception:
+            # 盘写不了（只读目录/无权限）→ 静默降级成"不落盘"，不影响使用
+            self.enabled, self.path = False, None
+
+    def _prune(self):
+        try:
+            d = os.path.dirname(self.path)
+            keep = {time.strftime("run-%Y%m%d.log",
+                                  time.localtime(time.time() - i * 86400))
+                    for i in range(self.KEEP_DAYS)}
+            for name in os.listdir(d):
+                if name.startswith("run-") and name.endswith(".log") and name not in keep:
+                    os.remove(os.path.join(d, name))
+        except Exception:
+            pass
+
+    def write(self, line):
+        if not (self.enabled and self.path):
+            return
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- 界面预览图
+
+# 预览图宽度上限。
+# 界面是按 2x 缩放显示的（本机 devicePixelRatio = 2.00），预览控件宽约 600 逻辑像素
+# → 要 ~1200 物理像素才不虚。480 是早期"能看清有没有人"的口径，在高分屏上偏糊；
+# 960 明显更清晰，代价只是每帧多一次 resize（对 5 FPS 可忽略）。
+PREVIEW_MAX_W = 960
+
+
+def _shrink(frame, max_w=PREVIEW_MAX_W):
+    """把帧缩成**界面显示用**的小图。
+
+    ⚠️ 只用于预览。**判定与存图都不走它** —— 判定用原始帧，
+    审核原图走 `ReviewStore(full_frame=...)`，各自保全最高清。
+    """
     if frame is None or pm.cv2 is None:
         return None
     try:

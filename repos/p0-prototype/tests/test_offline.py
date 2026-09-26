@@ -473,6 +473,63 @@ def test_threshold_suggest():
     case("G13 未知指标 -> None", pm.side_score("whatever", m, b), None)
 
 
+# ---------------------------------------------------------------- I. 最高清档 / 日志落盘
+
+def test_hd_and_logging():
+    """锁住两件容易在后续改动里被"顺手改回去"的事：
+
+    1. **采集档位必须是最高清**（用户 2026-09-26 明确要求）—— 一旦有人把它改小，
+       本机摄像头虽然仍给 1080p，但"请求值与实际值不一致"的坑会重现；
+    2. **运行日志必须落盘** —— GUI 里那份只在内存，关掉就没了，
+       排障/复测全靠文件。这条用源码级锁，防以后新增日志分支忘了接上。
+    """
+    print("\n[I] 最高清采集档 + 运行日志落盘")
+
+    case("I1 采集默认宽度 = 1920（最高档）", pm.DEFAULT_CAM_W, 1920)
+    case("I2 采集默认高度 = 1080（最高档）", pm.DEFAULT_CAM_H, 1080)
+    case("I3 引擎 config 的 width 与之一致（防两处漂移）",
+         pe_mod.DEFAULT_CONFIG["width"], pm.DEFAULT_CAM_W)
+    case("I4 引擎 config 的 height 与之一致",
+         pe_mod.DEFAULT_CONFIG["height"], pm.DEFAULT_CAM_H)
+    case("I5 审核默认存原图（用户要求处处最高清）",
+         pe_mod.DEFAULT_CONFIG["review_keep_fullres"], True)
+    case("I6 预览图宽度 ≥ 960（2x 缩放屏上不虚）",
+         pe_mod.PREVIEW_MAX_W >= 960, True)
+    case("I7 回放的时间轴格式化", pm._mmss(72.35), "01:12.3")
+    case("I8 回放指标串含当前值与基线",
+         "基线" in pm._fmt_metrics({"neck_angle": 20.0, "sh_ear_len": 200.0},
+                                   {"neck_angle": 6.0, "sh_ear_len": 210.0}), True)
+    case("I9 CLI 保留 --video 回放入口",
+         "--video" in pm.build_parser().format_help(), True)
+
+    import tempfile
+    import shutil
+    tmp = tempfile.mkdtemp(prefix="posture_log_")
+    try:
+        # 过期文件应被清掉，今天的应新建
+        old = os.path.join(tmp, "run-20000101.log")
+        open(old, "w").close()
+        rl = pe_mod.RunLog(tmp)
+        rl.write("[test] 一行日志")
+        case("I10 日志文件已创建", bool(rl.path) and os.path.isfile(rl.path), True)
+        case("I11 日志内容已落盘",
+             "一行日志" in open(rl.path, encoding="utf-8").read(), True)
+        case("I12 过期日志被剪掉（保留窗口内）", os.path.exists(old), False)
+        case("I13 日志目录路径也可用（自动补当天文件名）",
+             bool(pe_mod.RunLog(tmp).path), True)
+
+        off = pe_mod.RunLog(tmp, enabled=False)
+        off.write("不该写")
+        case("I14 --no-log 时不落盘", off.path, None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 源码级锁：新增/修改日志分支时不能绕过落盘
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    app_src = open(os.path.join(here, "posture_app.py"), encoding="utf-8").read()
+    case("I15 界面的 _log() 接了落盘", "self.runlog.write(line)" in app_src, True)
+
+
 # ---------------------------------------------------------------- 入口
 
 def main():
@@ -487,6 +544,7 @@ def main():
     test_sanity()
     test_threshold_suggest()
     test_silent_when_good()
+    test_hd_and_logging()
 
     print("\n" + "=" * 62)
     if FAILS:
