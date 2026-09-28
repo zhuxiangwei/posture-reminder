@@ -720,6 +720,54 @@ def test_camera_open_robustness():
     case("K18 --list-cameras 标注全零档位", "全零" in src, True)
 
 
+# ------------------------------------------------- L. HiDPI 显示（预览铺满）
+#
+# 背景（2026-09-28 用户报"视频窗口显示的只有四分之一"）：
+#   预览控件逻辑 520x290，本机屏幕 dpr=2.0 -> 物理 1040x580。
+#   原先在 setPixmap 时缩放到"控件当前尺寸"，两个坑叠在一起：
+#     ① QPixmap 从 QImage/文件来时 dpr=1.0，Qt 对 dpr=1.0 的 pixmap
+#        按 1 像素:1 **设备像素**画、不放缩 -> 只占 1/4 面积；
+#     ② 更隐蔽：尺寸被**固化在设置那一刻**。预览区高度会随表头提示语
+#        行数变化而回流，控件变大后旧 pixmap 就只占一角 —— 且**时好时坏**。
+#   修法：改成 ScaledImageLabel，在 **paintEvent** 里按**当前**尺寸缩放
+#        并设回 dpr。任何时刻自洽，不依赖调用时序。
+# 这组做源码级锁（Qt 渲染没法在无界面回归里跑，但"有没有退回旧写法"能静态查）。
+
+def test_hidpi_preview():
+    print("\n[L] HiDPI 显示（预览/审核图不得只显示 1/4 或一角）")
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    app = open(os.path.join(here, "posture_app.py"), encoding="utf-8").read()
+
+    case("L1 提供 ScaledImageLabel（绘制期缩放）",
+         "class ScaledImageLabel(QLabel)" in app, True)
+    case("L2 它在 paintEvent 里缩放（不靠调用时序）",
+         "def paintEvent(self, ev):" in app, True)
+    case("L3 缩放按控件物理尺寸（乘 dpr）",
+         "int(sz.width() * dpr)" in app, True)
+    case("L4 缩放后设回 devicePixelRatio",
+         "pm.setDevicePixelRatio(dpr)" in app, True)
+    case("L5 绘制前先走 QLabel 默认绘制（保住样式表背景与占位文字）",
+         "super().paintEvent(ev)" in app, True)
+
+    # 关键：不许再有"setPixmap 前先缩放到控件尺寸"的旧写法
+    import re as _re
+    case("L6 没有任何 setPixmap 调用（全部走 set_image）",
+         _re.findall(r"\.setPixmap\(", app), [])
+    case("L7 没有 pix.scaled(widget.size()) 的旧写法",
+         _re.findall(r"\.scaled\(\s*self\.\w+\.size\(\)", app), [])
+
+    case("L8 预览走 set_image", "self.preview.set_image(" in app, True)
+    case("L9 审核大图也走 set_image（同一处坑）",
+         "self.img.set_image(" in app, True)
+    case("L10 两个控件都用 ScaledImageLabel",
+         app.count("ScaledImageLabel(") >= 3, True)   # 类定义 1 + 两个实例
+
+    # 预览图必须不小于控件物理宽度，否则缩放变成上采样、会发虚
+    case("L11 PREVIEW_MAX_W >= 1280（控件物理宽实测 1040，须留余量）",
+         pe_mod.PREVIEW_MAX_W >= 1280, True)
+
+
 # ---------------------------------------------------------------- 入口
 
 def main():
@@ -737,6 +785,7 @@ def main():
     test_hd_and_logging()
     test_sac_matplotlib_compat()
     test_camera_open_robustness()
+    test_hidpi_preview()
 
     print("\n" + "=" * 62)
     if FAILS:

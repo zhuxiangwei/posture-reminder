@@ -174,7 +174,7 @@ posture-reminder/
     ├── posture_monitor.py         判定逻辑 + 命令行
     ├── posture_engine.py          后台线程引擎（采集+推理+判定+迟滞+语音）
     ├── posture_app.py             PySide6 图形界面
-    ├── tests/test_offline.py      145 个离线用例（不需要摄像头）
+    ├── tests/test_offline.py      156 个离线用例（不需要摄像头）
     └── voice/                     预生成语音（7 条 wav）
 ```
 

@@ -37,7 +37,7 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import Qt, QEvent, QTimer, QRectF, QPointF
+from PySide6.QtCore import Qt, QEvent, QSize, QTimer, QRectF, QPointF
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QKeyEvent, QPainter,
                            QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
@@ -123,6 +123,52 @@ def apply_app_font(app):
             return name
     app.setFont(QFont("", 10))
     return None
+
+
+class ScaledImageLabel(QLabel):
+    """图片**始终**按当前控件尺寸铺满的 QLabel（HiDPI 安全）。
+
+    为什么不用「setPixmap 前先缩放到控件尺寸」：
+      那会把尺寸**固化在设置那一刻**。而本界面的预览区高度会变
+      （表头提示语一行/两行不同 -> 布局回流），控件一变，
+      固化的小 pixmap 就只占一角 —— 实测表现为「视频窗口只显示四分之一」，
+      且**时好时坏**（取决于最后一次 setPixmap 时控件多大）。
+      → 改成在 paintEvent 里按**当前**尺寸缩放，任何时刻都自洽，也不依赖调用时序。
+
+    HiDPI 要点：缩放到「控件逻辑尺寸 × devicePixelRatio」，再把 dpr 设回去。
+    直接 scaled(控件逻辑尺寸) 在 2x 屏上会只占 1/4 面积。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._src = None          # 源图（保持原始分辨率，缩放推迟到绘制时）
+
+    def set_image(self, pix):
+        """设置源图。传 None 等价于 clear_image()。"""
+        self._src = None if (pix is None or pix.isNull()) else pix
+        self.setText("")          # 有图就不显示占位文字
+        self.update()
+
+    def clear_image(self):
+        self._src = None
+        self.update()
+
+    def paintEvent(self, ev):
+        # 先让 QLabel 走默认绘制：保留样式表背景与占位文字
+        super().paintEvent(ev)
+        if self._src is None:
+            return
+        dpr = self.devicePixelRatioF() or 1.0
+        sz = self.size()
+        target = QSize(max(1, int(sz.width() * dpr)), max(1, int(sz.height() * dpr)))
+        pm = self._src.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm.setDevicePixelRatio(dpr)
+        # KeepAspectRatio 后按逻辑尺寸居中
+        w = pm.width() / dpr
+        h = pm.height() / dpr
+        p = QPainter(self)
+        p.drawPixmap(int((sz.width() - w) / 2), int((sz.height() - h) / 2), pm)
+        p.end()
 
 
 # ---------------------------------------------------------------- 手绘表情
@@ -306,7 +352,7 @@ class PostureApp(QWidget):
         t1 = QLabel("摄像头画面")
         t1.setObjectName("cardTitle")
         lv.addWidget(t1)
-        self.preview = QLabel("等待画面…")
+        self.preview = ScaledImageLabel("等待画面…")
         self.preview.setObjectName("preview")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(340, 190)
@@ -420,10 +466,11 @@ class PostureApp(QWidget):
             h, w, ch = img.shape
             # QImage 不持有 numpy 缓冲，必须 copy() 后再交给 QPixmap
             qimg = QImage(img.data, w, h, ch * w, QImage.Format_BGR888).copy()
-            pix = QPixmap.fromImage(qimg)
-            self.preview.setPixmap(pix.scaled(self.preview.size(), Qt.KeepAspectRatio,
-                                              Qt.SmoothTransformation))
-            self.preview.setText("")
+            # 只交出源图，缩放由控件在**绘制时**按当前尺寸做。
+            # ⚠️ 不能在这里先缩放到控件尺寸：预览区高度会随表头提示语的行数变化
+            #    （一行 vs 两行 → 布局回流），提前缩放会把尺寸固化下来，
+            #    控件变大后图片只占一角（实测就是"只显示四分之一"，且时好时坏）。
+            self.preview.set_image(QPixmap.fromImage(qimg))
         except Exception:
             pass      # 预览失败绝不影响提醒主功能
 
@@ -761,7 +808,7 @@ class ReviewPanel(QWidget):
         self.lbl_stats.setStyleSheet("font-weight:700;")
         v.addWidget(self.lbl_stats)
 
-        self.img = QLabel("（没有待审核的现场）")
+        self.img = ScaledImageLabel("（没有待审核的现场）")
         self.img.setObjectName("preview")
         self.img.setAlignment(Qt.AlignCenter)
         self.img.setMinimumHeight(200)
@@ -819,7 +866,7 @@ class ReviewPanel(QWidget):
             f"提醒的误报率 {fp}")
 
         if not self._items:
-            self.img.setPixmap(QPixmap())
+            self.img.clear_image()
             self.img.setText("（没有待审核的现场）")
             self.info.setText("")
             for b in (self.btn_notrigger, self.btn_trigger, self.btn_skip):
@@ -833,10 +880,15 @@ class ReviewPanel(QWidget):
             d = it["data"]
             try:
                 pix = QPixmap(it["jpg"])
-                self.img.setText("")
-                self.img.setPixmap(pix.scaled(self.img.size(), Qt.KeepAspectRatio,
-                                             Qt.SmoothTransformation))
+                if pix.isNull():
+                    # QPixmap 读失败不抛异常，只给个空对象 —— 显式当错误处理，
+                    # 否则界面会"什么都没有"，看不出是图坏了
+                    raise ValueError("QPixmap 为空")
+                # 同预览：只交源图，缩放交给控件在绘制时做（见 ScaledImageLabel）
+                self.img.set_image(pix)
             except Exception:
+                # 先清源图再显示错误文字，否则旧图会盖在文字上
+                self.img.clear_image()
                 self.img.setText("（图片读取失败）")
 
             reminder = d.get("kind") == "reminder"

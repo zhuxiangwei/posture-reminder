@@ -190,7 +190,7 @@ envs\posture\Scripts\python.exe posture_monitor.py --camera 0 --camera2 1 --cali
 python tests/test_offline.py
 ```
 
-用合成关键点回归判定逻辑，**145 个用例**，改代码后先跑这个：
+用合成关键点回归判定逻辑，**156 个用例**，改代码后先跑这个：
 
 | 组 | 覆盖 |
 |---|---|
@@ -349,7 +349,7 @@ envs\posture\Scripts\python.exe tools\make_voice.py --list          # 看有哪�
 | `posture_monitor.py` | **判定逻辑 + CLI**。指标计算、判定、迟滞闸（ReminderGate）、融合、标定自检、bench |
 | `posture_engine.py` | **运行时引擎（线程化）**。采集→推理→判定→迟滞→语音，对界面暴露快照与指令 |
 | `posture_app.py` | **PySide6 图形界面**。只画界面，不碰摄像头/推理 |
-| `tests/test_offline.py` | **145 个离线回归用例**（不需要摄像头和依赖） |
+| `tests/test_offline.py` | **156 个离线回归用例**（不需要摄像头和依赖） |
 | `config.json` | 家长设置（自动生成） |
 | `baseline.json` | 个人基线（自动生成，跟着机位走） |
 | `logs/run-YYYYMMDD.log` | 运行日志（自动生成，纯文本，保留最近 7 天；`--no-log` 可关） |
@@ -437,6 +437,7 @@ envs\posture\Scripts\python.exe tools\make_voice.py --list          # 看有哪�
 | **`except ImportError` 吞掉真病因** | 实际是 SAC 拦了 pyd，报出的却是 `AttributeError: 'NoneType' object has no attribute 'PoseLandmarker'`，排查方向全错 | 保留原始异常（`_MP_IMPORT_ERR`），在 `_need_mp()` 里带出原文 |
 | **GUI 路径没做依赖守卫** | CLI 有 `_need_mp()`，GUI 走引擎绕过它，于是在 `make_landmarker` 处以 `NoneType` 炸 | 引擎里补前置检查（`pm.vision is None` → `_need_mp()`） |
 | **照搬别处的后端结论** | 换摄像头后结论会**完全反转**（旧：只有 MSMF 能用；新：DSHOW 能用、MSMF 卡死），照搬会导致卡死或全黑 | 换设备后跑 `--list-cameras` 重测；判据用"能否读到有效画面"，不写死后端 |
+| **HiDPI：图片只显示 1/4** | 2x 屏上预览只占左上角一块。两个坑叠加：① `QPixmap.fromImage()` 的 dpr=1.0，Qt 按 1 像素:1 **设备像素**画、不放大 → 只占一半宽×一半高；② 原写法在 `setPixmap` 时缩放到"控件**当时**尺寸"，而预览区高度会随表头文字行数回流变化，控件一变旧 pixmap 就只占一角（**时好时坏**） | 缩放搬到 **`paintEvent`**：按**当前**尺寸×dpr 缩放后再画（`ScaledImageLabel`）。任何时刻自洽、不依赖调用时序。**别在设置时固化尺寸** |
 | 写死 DSHOW 后端 | 报"打不开任何摄像头"，其实设备在 | 按 DSHOW→MSMF→ANY 依次尝试 |
 | 误检帧污染基线 | **画面里没人也能"标定成功"**，基线是垃圾（span=0.037） | 加合理性粗筛，拒绝不可信帧 |
 | 无人的帧拉低基准 | 测出 13.2ms，实际含人要 19.2ms（乐观 40%） | 基准分开统计含人/无人帧，检出率 <50% 时主动报警 |
