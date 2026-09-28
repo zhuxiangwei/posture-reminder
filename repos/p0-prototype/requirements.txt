@@ -1,6 +1,6 @@
 # 坐姿小卫士 · 运行依赖
 #
-# ⚠️ 三条关键约束，都是实测踩出来的，照抄下面的安装步骤能全部避开。
+# ⚠️ 四条关键约束，都是实测踩出来的，照抄下面的安装步骤能全部避开。
 #
 # ── 约束 1：解释器用 Python 3.13（本项目**不需要** tkinter）
 #    早期界面用过 tkinter，才留下"必须用系统 Python 3.12（带 tk 8.6）"这条约束。
@@ -21,6 +21,64 @@
 # ── 约束 3：装 `PySide6-Essentials`，**不要**装 `PySide6` 元包
 #    原因见下方"界面"一节包注释（Addons 覆盖 Essentials 的既有文件，
 #    pip 连续 unlink 满 50 次即触发批量删除护栏、安装被中断）。
+#
+# ── 约束 4：Windows 智能应用控制（SAC）会拦 matplotlib 的 `_image.pyd`
+#    （2026-09-28 实装踩到，排查全过程有硬证据，见下）
+#
+#    症状：程序启动后崩在「摄像头就绪」之后，日志里是
+#        AttributeError: 'NoneType' object has no attribute 'PoseLandmarker'
+#        （posture_engine.py 的 self._lm = pm.make_landmarker(model)）
+#    这个报错和真病因毫无关系。真病因是多米诺：
+#        SAC 拦 _image.cp313-win_amd64.pyd
+#          -> matplotlib.pyplot 导入失败
+#          -> mediapipe .../vision/drawing_utils.py:21 硬导入 matplotlib.pyplot 失败
+#          -> mediapipe.tasks.python.vision 整包导入失败
+#          -> posture_monitor 里 vision 退化成 None
+#
+#    实测证据（都是本机跑出来的，不是推测）：
+#      · ImportError: DLL load failed while importing _image:
+#        应用程序控制策略已阻止此文件。
+#      · 该 pyd **完好**：MZ 头正确、446976 字节、md5 正常 —— 不是病毒、不是损坏。
+#      · 同目录 _path / ft2font / _c_internal_utils，以及 numpy / cv2 / PySide6
+#        全部正常导入；**只有这一个文件被拦**。
+#      · 改名成 _image2.pyd 照样被拦 —— SAC 按**文件内容/签名**判，搬走改名都无效。
+#      · 策略状态（HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy）：
+#            VerifiedAndReputablePolicyState = 1   # 1 = Enforced
+#            SAC_PreviousState               = 2   # 曾经是"评估"模式
+#        这解释了为什么 9-26 建环境时能跑、9-28 突然挂：SAC 从评估转强制后会
+#        动态收紧，把环境里的未签名 pyd 挑出来拦。
+#      · CodeIntegrity/Operational 事件日志（Id 3077/3033）逐条点名：
+#            python.exe attempted to load ...matplotlib\_image.cp313-win_amd64.pyd
+#            that did not meet the Enterprise signing level requirements or
+#            violated code integrity policy (Policy ID:{0283ac0f-...})
+#        该 Policy ID 正是开机日志里的 "VerifiedAndReputable Desktop"（= SAC）。
+#        时间分布：08-31×2、09-15×2、09-17×8、**09-28×76（最后一条 13:54:15）**。
+#      · 反证：禁用桩 -> vision = None 且原报错重现；启用桩 -> vision 正常。
+#
+#    ★★ 关键补充（2026-09-28 当天稍后复测）：**这个拦截是临时的、会自愈 ★★
+#        同一个字节完全相同的文件 —— md5 仍是 e43f68f3905a4006081f766dbc6f68ea、
+#        mtime 仍为 9-26 17:12:51、446976 字节 —— **重启一次电脑后就能正常导入**，
+#        而策略注册表值（仍为 Enforced=1）没有任何变化。
+#        日志佐证：14:18:04（开机时刻）出现
+#            "Refreshed and activated Code Integrity policy {0283ac0f-...}
+#             VerifiedAndReputable Desktop"
+#        即 SAC 策略在开机时被**刷新并激活**，带来更新的云信誉数据，
+#        原先"本地没见过 -> 保守拦截"的文件因此被放行。
+#        → 处置优先级修正为：
+#          1) **先重启一次电脑**（最省事，实测有效，改天可能又自愈）
+#          2) 仍不行再靠本项目的桩兜底（不改系统设置）
+#          3) 最后才考虑关闭 SAC（**不可逆**，关了必须重装 Windows 才能恢复）
+#
+#    修法（已实装，**不需要改任何系统设置**）：
+#        repos/p0-prototype/compat_matplotlib.py
+#        —— 在 import mediapipe 之前调 install()，用轻量桩顶掉 matplotlib。
+#    为什么能这么修：matplotlib 在 mediapipe 里**只被一个 3D 调试可视化函数**
+#        （drawing_utils.plot_landmarks 的 plt.figure/axes/show）使用，
+#        **推理管线完全不碰它**；本项目代码也 0 处引用（全仓 grep 确认）。
+#        所以顶掉它零代价。实测三档模型（lite/full/heavy）× VIDEO 模式全部跑通。
+#    注意事项：真实 matplotlib 可用时（未开 SAC 的机器）桩**完全不介入**；
+#        桩内任何绘图调用都会显式抛 NotImplementedError，绝不假装能用。
+#        matplotlib 本身不必卸载，留着也不会被加载（桩已抢先注册 sys.modules）。
 #
 # ── 安装步骤（照抄）
 #   <Python 3.13> -m venv envs\posture

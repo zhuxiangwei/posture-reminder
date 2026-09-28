@@ -40,7 +40,7 @@ import time
 from PySide6.QtCore import Qt, QEvent, QTimer, QRectF, QPointF
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QKeyEvent, QPainter,
                            QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QProgressBar, QPushButton,
                                QRadioButton, QScrollArea, QSizePolicy, QTabWidget,
@@ -519,6 +519,17 @@ class PostureApp(QWidget):
     def closeEvent(self, ev):
         if self.engine:
             self.engine.stop()
+            # ⚠️ 必须等引擎线程真正收尾再往下走。
+            #    否则解释器开始拆除时，引擎可能正卡在 detect_for_video 里，
+            #    mediapipe 的 ThreadPoolExecutor 已被 atexit 关掉，会抛
+            #        RuntimeError: cannot schedule new futures after shutdown
+            #    不影响功能（异常被引擎的兜底捕获），但会往日志里写一段
+            #    看不懂的栈，并且拖慢进程退出（实测曾残留上百秒）。
+            #    join 带超时，卡住也不会把界面挂死（引擎是 daemon 线程）。
+            try:
+                self.engine.join(timeout=3.0)
+            except Exception:
+                pass
         self._timer.stop()
         super().closeEvent(ev)
 

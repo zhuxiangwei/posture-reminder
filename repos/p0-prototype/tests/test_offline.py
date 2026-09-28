@@ -473,20 +473,35 @@ def test_threshold_suggest():
     case("G13 未知指标 -> None", pm.side_score("whatever", m, b), None)
 
 
-# ---------------------------------------------------------------- I. 最高清档 / 日志落盘
+# ------------------------------------------------- I. 采集档位 / 日志落盘
 
 def test_hd_and_logging():
     """锁住两件容易在后续改动里被"顺手改回去"的事：
 
-    1. **采集档位必须是最高清**（用户 2026-09-26 明确要求）—— 一旦有人把它改小，
-       本机摄像头虽然仍给 1080p，但"请求值与实际值不一致"的坑会重现；
+    1. **采集档位 = 3840x2160（4K）+ MJPG**（2026-09-28 实测定稿）。
+       历史沿革值得记住（三轮结论，前两轮都是错的）：
+         · 09-26：摄像头（Nebula 02）只输出 1080p 且不慢 → 定 1920x1080
+         · 09-28 早：发现新摄像头 1080p 只有 3.3 FPS < 5 FPS 要求 → 改成 720p
+         · 09-28 晚（**用户点破"这是 4K 摄像头"后**）：真因是**压缩格式** ——
+           OpenCV 默认走 YUY2 未压缩，USB 2.0 带宽喂不动高分辨率；
+           切 **MJPG** 后 **4K 反而 100% 可靠、~14 FPS**。前两轮结论都是
+           YUY2 造成的假象。
+       ⚠️ 所以这里锁的是"4K + MJPG"这一**组合**，别只改一半。
     2. **运行日志必须落盘** —— GUI 里那份只在内存，关掉就没了，
        排障/复测全靠文件。这条用源码级锁，防以后新增日志分支忘了接上。
     """
-    print("\n[I] 最高清采集档 + 运行日志落盘")
+    print("\n[I] 采集档位 + 运行日志落盘")
 
-    case("I1 采集默认宽度 = 1920（最高档）", pm.DEFAULT_CAM_W, 1920)
-    case("I2 采集默认高度 = 1080（最高档）", pm.DEFAULT_CAM_H, 1080)
+    case("I1 采集默认宽度 = 3840（4K）", pm.DEFAULT_CAM_W, 3840)
+    case("I2 采集默认高度 = 2160", pm.DEFAULT_CAM_H, 2160)
+    case("I2b 提供 MJPG FOURCC 常量（USB2.0 跑高分辨率的唯一出路）",
+         hasattr(pm, "MJPG_FOURCC") and pm.MJPG_FOURCC != 0, True)
+    # FOURCC 必须设在分辨率**之前**（格式协商发生在选模式时），顺序写反会静默失效
+    _src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "posture_monitor.py"), encoding="utf-8").read()
+    case("I2c open_camera 里 FOURCC 先于分辨率设置",
+         _src.index("cap.set(cv2.CAP_PROP_FOURCC, MJPG_FOURCC)") <
+         _src.index("cap.set(cv2.CAP_PROP_FRAME_WIDTH, res[0])"), True)
     case("I3 引擎 config 的 width 与之一致（防两处漂移）",
          pe_mod.DEFAULT_CONFIG["width"], pm.DEFAULT_CAM_W)
     case("I4 引擎 config 的 height 与之一致",
@@ -530,6 +545,181 @@ def test_hd_and_logging():
     case("I15 界面的 _log() 接了落盘", "self.runlog.write(line)" in app_src, True)
 
 
+# ------------------------------------------------ J 组：SAC 拦截 matplotlib 的兜底
+#
+# 背景：本机 Windows 智能应用控制（SAC）拦掉了 matplotlib 的 _image.pyd，
+#       mediapipe 的 vision 包因硬导入 matplotlib.pyplot 而整包失败，
+#       表现为 `AttributeError: 'NoneType' object has no attribute 'PoseLandmarker'`。
+#       修法是 compat_matplotlib.py 用桩顶掉 matplotlib（详见该模块文档）。
+# 这组用例锁定：桩存在、幂等、不干扰真实 matplotlib、报错能带出真病因。
+
+def test_sac_matplotlib_compat():
+    print("\n[J] Windows SAC 拦截 matplotlib 的兜底")
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "compat_matplotlib.py"), encoding="utf-8").read()
+
+    case("J1 桩模块存在", os.path.exists(os.path.join(here, "compat_matplotlib.py")), True)
+    case("J2 桩提供 install()", "def install(" in src, True)
+    case("J3 桩提供 stub_active()", "def stub_active(" in src, True)
+    case("J4 桩顶掉的是 matplotlib.pyplot", 'sys.modules["matplotlib.pyplot"] = pyplot' in src, True)
+
+    # 主模块必须真的调用它，而不是只把文件放那儿
+    mon_src = open(os.path.join(here, "posture_monitor.py"), encoding="utf-8").read()
+    case("J5 posture_monitor 调用 install()", "compat_matplotlib.install()" in mon_src, True)
+    # 桩必须装在 mediapipe 之前（否则 mediapipe 已经导入失败了）
+    case("J6 桩在 import mediapipe 之前装上",
+         mon_src.index("compat_matplotlib.install()") < mon_src.index("import mediapipe as mp"), True)
+
+    # 真正导入一遍，验证实际行为（不只做源码字符串匹配）
+    sys.path.insert(0, here)
+    try:
+        import compat_matplotlib as cm
+
+        # 幂等：装了桩之后重复 install 不该再动手
+        cm.install()
+        case("J7 install() 幂等（二次返回 False）", cm.install(), False)
+
+        # 幂等的前提是"已经处理过"，而处理结果取决于真实 matplotlib 是否可用。
+        # 两种结果都合法，但**必须能确定地测出桩本身的行为**——
+        # 不能像原来那样"真实库可用就跳过绘图报错那条"，
+        # 否则测试条数会随机器状态漂移（曾出现 117 变 116）。
+        if cm.stub_active():
+            case("J8 桩已激活（本机 matplotlib 可用时返回 False 才对）",
+                 cm.stub_active(), True)
+        else:
+            case("J8 真实 matplotlib 可用时桩不介入", cm.stub_active(), False)
+
+        # 无论哪条分支，都直接构造一个桩来验证它的行为契约（确定性）
+        stub_pyplot = cm._make_pyplot_stub()
+        try:
+            stub_pyplot.figure()
+            raised = False
+        except NotImplementedError:
+            raised = True
+        # 关键：绘图调用必须显式报错，不能假装能用（否则会变成更难查的故障）
+        case("J9 桩的绘图调用显式抛 NotImplementedError", raised, True)
+        # 桩必须补齐 mediapipe drawing_utils 会碰到的名字
+        case("J9b 桩补齐 figure/axes/show",
+             all(hasattr(stub_pyplot, n) for n in ("figure", "axes", "show")), True)
+
+        # mediapipe 的 vision 必须可用 —— 这是本次修复的最终目的
+        from mediapipe.tasks.python import vision as _v
+        case("J10 装上桩后 vision.PoseLandmarker 可用",
+             hasattr(_v, "PoseLandmarker"), True)
+    except ImportError as e:
+        # 测试机没装 mediapipe 时跳过（离线自检本身不依赖它）
+        print(f"  SKIP  J8~J10（本机无 mediapipe：{e}）")
+    finally:
+        if here in sys.path:
+            sys.path.remove(here)
+
+    # 静态锁：报错可见性 —— 不许再静默吞掉 mediapipe 的导入异常
+    case("J11 保留原始导入异常（不再是裸 except）",
+         "_MP_IMPORT_ERR = _e" in mon_src, True)
+    case("J12 _need_mp() 会带出原始报错",
+         "_MP_IMPORT_ERR is not None" in mon_src, True)
+    # GUI 路径（engine）必须自己补守卫，它不经过 CLI 的 _need_mp()
+    eng_src = open(os.path.join(here, "posture_engine.py"), encoding="utf-8").read()
+    case("J13 引擎在 make_landmarker 前补了依赖守卫",
+         "pm.vision is None" in eng_src, True)
+    case("J14 引擎的守卫在 make_landmarker 之前",
+         eng_src.index("pm.vision is None") < eng_src.index("pm.make_landmarker(model)"), True)
+
+
+# --------------------------------------- K. 摄像头开流鲁棒性（2026-09-28 实装踩坑）
+#
+# 背景：换摄像头后启动画面全黑。根因不是"SAC"（那是另一件事），而是：
+#   ① `cap.read()` 返回 ok=True 但**内容全零**（驱动接受格式协商却填不进数据）
+#      —— 只判 ok 就会选中这种破开流，然后对着黑图跑。
+#   ② 这种坏开流**重开设备就好**，不是档位不支持。
+#   ③ 但"**好的**开流"前几帧也是全零（1080p 要 3 帧），早退判据设小了会误杀好开流。
+# 这组用例把这几条钉住，避免以后又被"顺手简化"掉。
+
+class _FakeFrame:
+    """够 frame_is_usable 用的最小帧替身（避免为测试引入 numpy）。"""
+
+    def __init__(self, max_pixel, shape=(720, 1280, 3)):
+        self._max = max_pixel
+        self.shape = shape
+        self.size = shape[0] * shape[1] * shape[2]
+
+    def max(self):
+        return self._max
+
+
+def test_camera_open_robustness():
+    print("\n[K] 摄像头开流鲁棒性（全零帧 / 重开 / 预热容限）")
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "posture_monitor.py"), encoding="utf-8").read()
+
+    # ---- frame_is_usable：全零帧必须判为不可用
+    case("K1 全零帧判为不可用", pm.frame_is_usable(_FakeFrame(0)), False)
+    case("K2 有内容的帧判为可用", pm.frame_is_usable(_FakeFrame(255)), True)
+    case("K3 极暗但有信号（max=9）判为可用", pm.frame_is_usable(_FakeFrame(9)), True)
+    case("K4 边界：max=8 判为可用（阈值含等号）",
+         pm.frame_is_usable(_FakeFrame(8)), True)
+    case("K5 边界：max=7 判为不可用",
+         pm.frame_is_usable(_FakeFrame(7)), False)
+    # 空帧 / None 不能抛异常（驱动抽风时会返回 None）
+    case("K6 None 帧不抛异常且判为不可用", pm.frame_is_usable(None), False)
+    case("K7 空数组帧判为不可用", pm.frame_is_usable(_FakeFrame(255, (0, 0, 3))), False)
+
+    # ---- 预热容限：判据用 max 而非 mean（避免把正常偏暗画面误杀）
+    case("K8 判据基于 max（大面积暗 + 一个亮点也算有画面）",
+         pm.frame_is_usable(_FakeFrame(200)), True)
+    case("K9 源码里确实是 frame.max() 而非 mean()", "frame.max()" in src, True)
+
+    # ---- 预热容限：必须按档位给，不能一刀切
+    #     实测好开流的预热帧数：480p=0 / 720p=1 / 1080p=3。
+    #     设太小 -> 误杀好开流（曾把 1080p 全部误杀）；
+    #     设太大（一刀切 4）-> 720p 的坏开流白等 4s，启动被拖慢一倍。
+    import inspect as _ins
+    sig = _ins.signature(pm.wait_usable_frame)
+    case("K10 wait_usable_frame 的 blank_abort 默认随档位走（未写死）",
+         sig.parameters["blank_abort"].default is None, True)
+    case("K10b 720p 的预热容限 > 1（要让 1 帧预热的好开流通过）",
+         pm.warmup_budget(1280, 720) > 1, True)
+    case("K10c 1080p 的预热容限 > 3（要让 3 帧预热的好开流通过）",
+         pm.warmup_budget(1920, 1080) > 3, True)
+    case("K10d 720p 比 1080p 的容限小（坏开流别白等）",
+         pm.warmup_budget(1280, 720) < pm.warmup_budget(1920, 1080), True)
+
+    # ---- 重试开流：坏开流必须换新句柄重开
+    case("K11 定义了 MAX_OPEN_ATTEMPTS", hasattr(pm, "MAX_OPEN_ATTEMPTS"), True)
+    case("K12 MAX_OPEN_ATTEMPTS >= 3（单次开流有失败率，要留重试余量）",
+         pm.MAX_OPEN_ATTEMPTS >= 3, True)
+    case("K13 open_camera 里确实做了重开循环",
+         "MAX_OPEN_ATTEMPTS" in src and "for attempt in range" in src, True)
+
+    # ---- 超时保护：cv2 的 C 层阻塞 try/except 抓不住，必须靠线程 join
+    case("K14 提供带超时的读帧 read_frame_timed", hasattr(pm, "read_frame_timed"), True)
+    case("K15 超时用线程 join 实现（不是 try/except）",
+         "join(" in src and "threading.Thread" in src, True)
+
+    # ---- 后端阻塞：MSMF 连构造函数都会无限阻塞，必须能被跳过
+    case("K16 有后端阻塞的降级路径（skipped 集合）", "skipped" in src, True)
+    # ⚠️ 关键：创建 cap 必须发生在**调用线程**。
+    #    DSHOW 走 COM，cap 绑定创建它的线程的 COM 单元。
+    #    实测 2x2（1280x720 DSHOW，每格 5 轮独立进程）：
+    #        创建=主线程  -> 4/5 ~ 3/5（可用）
+    #        创建=工作线程 -> 0/5（**完全不可用**）
+    #    所以**不能**用"工作线程里创建 + 超时 join"这套（曾这么写过，是错的）。
+    case("K16b 不提供跨线程创建 cap 的危险函数（open_cap_timed 已移除）",
+         not hasattr(pm, "open_cap_timed"), True)
+    case("K16c 构造函数子进程探测（可硬杀，防卡死）",
+         hasattr(pm, "backend_viable_subprocess"), True)
+    case("K16d 创建 cap 的调用不在工作线程包装里出现在创建点附近",
+         "cap = cv2.VideoCapture(i, be)" in src, True)
+    case("K16e 构造函数超时常量存在",
+         hasattr(pm, "OPEN_PROBE_TIMEOUT") and pm.OPEN_PROBE_TIMEOUT > 0, True)
+
+    # ---- 报错要区分"打不开"与"打开了但没画面"
+    case("K17 报错文案覆盖全零帧情形", "画面全零" in src, True)
+    case("K18 --list-cameras 标注全零档位", "全零" in src, True)
+
+
 # ---------------------------------------------------------------- 入口
 
 def main():
@@ -545,6 +735,8 @@ def main():
     test_threshold_suggest()
     test_silent_when_good()
     test_hd_and_logging()
+    test_sac_matplotlib_compat()
+    test_camera_open_robustness()
 
     print("\n" + "=" * 62)
     if FAILS:

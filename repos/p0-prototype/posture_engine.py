@@ -770,6 +770,13 @@ class PostureEngine(threading.Thread):
             model = pm.find_model(self.cfg.get("model", pm.DEFAULT_MODEL))
             self._set(phase="opening", text="正在打开摄像头…")
             self._log(f"模型：{model}")
+            # ⚠️ GUI 路径不经过 posture_monitor 的 CLI 入口，那里的 _need_mp() 守卫
+            #    在这里不会被执行。不补这一句，mediapipe 导入失败（例如本机 SAC 拦了
+            #    matplotlib 的 _image.pyd）会一路走到 make_landmarker，报出一个与真病因
+            #    毫无关系的 `AttributeError: 'NoneType' object has no attribute
+            #    'PoseLandmarker'`。这里提前拦，让原始报错能进日志。
+            if pm.vision is None or pm.mp_python is None:
+                pm._need_mp()   # 报错文案里带原始异常原文（sys.exit 由下面兜住）
             # ⚠️ 时间戳基准必须**全生命周期只设一次**。
             # MediaPipe 的 VIDEO 模式要求 detect_for_video 的时间戳单调递增；
             # 若在标定里用 `now - t0` 而重标定时把 t0 归零，时间戳会倒退，推理结果直接错。
@@ -798,8 +805,17 @@ class PostureEngine(threading.Thread):
             self._set(phase="error", error=str(e) or "启动失败")
             self._log(f"启动失败：{e}")
         except Exception as e:
-            self._set(phase="error", error=f"{type(e).__name__}: {e}")
-            self._log("异常：\n" + traceback.format_exc())
+            # ⚠️ 关闭期间的解释器拆除噪音，不要当成"故障"记进日志。
+            #    实测关窗时若引擎正卡在 detect_for_video 里，mediapipe 的
+            #    ThreadPoolExecutor 已被 atexit 关掉，会抛
+            #        RuntimeError: cannot schedule new futures after shutdown
+            #    这不是功能问题（进程正常退出），但记成"异常"会往日志里写一段
+            #    看不懂的栈、误导后续排查。
+            if self._stop.is_set():
+                self._log(f"（关闭中，忽略：{type(e).__name__}: {e}）")
+            else:
+                self._set(phase="error", error=f"{type(e).__name__}: {e}")
+                self._log("异常：\n" + traceback.format_exc())
         finally:
             if self._cap is not None:
                 try:

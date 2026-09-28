@@ -50,7 +50,9 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------- 依赖（延迟报错）
@@ -62,11 +64,30 @@ try:
 except ImportError:
     cv2 = None
 
+# mediapipe 的 vision 包会无条件 `import matplotlib.pyplot`（只为那个 3D 调试
+# 可视化函数 plot_landmarks）。本机 Windows 智能应用控制（SAC）拦掉了
+# matplotlib/_image.cp313-win_amd64.pyd，导致整包导入失败 —— 在这里先用桩顶掉，
+# 详见 compat_matplotlib.py 的模块文档。真实 matplotlib 可用时它什么都不做。
+try:
+    import compat_matplotlib
+    compat_matplotlib.install()
+except Exception:
+    pass
+
+_MP_IMPORT_ERR = None
 try:
     import mediapipe as mp
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision
-except ImportError:
+except ImportError as _e:
+    # 刻意把原始报错留下来：SAC 拦截时抛的是
+    #   ImportError: DLL load failed while importing _image:
+    #   应用程序控制策略已阻止此文件。
+    # 以前这里只写 `except ImportError: vision = None`，异常被吞掉，
+    # 最后在引擎里变成一个莫名其妙的
+    #   AttributeError: 'NoneType' object has no attribute 'PoseLandmarker'
+    # 真病因完全看不到。留着原文，_need_mediapipe() 会把它一起报出来。
+    _MP_IMPORT_ERR = _e
     mp = mp_python = vision = None
 
 
@@ -77,7 +98,16 @@ def _need_cv():
 
 def _need_mp():
     if mp is None or vision is None:
-        sys.exit("缺少 mediapipe。请先执行： pip install mediapipe")
+        msg = "缺少 mediapipe（或 mediapipe 导入失败）。请先执行： pip install mediapipe"
+        if _MP_IMPORT_ERR is not None:
+            # 把真正的异常原文附上，不要只报一个 None。
+            msg += f"\n\n导入 mediapipe 时的原始报错：\n  {type(_MP_IMPORT_ERR).__name__}: {_MP_IMPORT_ERR}"
+            if "应用程序控制策略" in str(_MP_IMPORT_ERR) or "Smart App Control" in str(_MP_IMPORT_ERR):
+                msg += ("\n\n这看起来是 Windows 智能应用控制（SAC）拦截了第三方扩展 DLL。\n"
+                        "  排查：设置 > 隐私和安全性 > Windows 安全中心 > 应用和浏览器控制 > 智能应用控制\n"
+                        "  项目已内置兼容桩 compat_matplotlib.py；若仍报此错，说明被拦的不止 matplotlib，\n"
+                        "  把上面那段原始报错发出来定位具体文件。")
+        sys.exit(msg)
 
 
 # ---------------------------------------------------------------- 配置
@@ -150,20 +180,41 @@ L_EAR, R_EAR = 7, 8
 L_SH, R_SH = 11, 12
 L_HIP, R_HIP = 23, 24
 
-# ⚠️ 采集分辨率：默认取**摄像头能给的最高档 1920x1080**。
-#   两台机器实测行为不同，两个知识点都留在这：
-#   ① 本机 USB 摄像头 Nebula 02（VID_3AAE&PID_6373）**只输出 1920x1080 @30fps**，
-#      请求 640x480 / 1280x720 / 1920x1080 读回来**都是 1080p**（2026-09-26 实测 10 组组合）。
-#      → 本机怎么设都在用最高档；默认取 1080p 是为了**让代码与实际一致**，
-#        避免"请求 720p 却拿到 1080p"这种看不出来的隐性偏差。
-#   ② 笔记本 HP HD Camera（标称 720p）：**不设时 OpenCV 只给 640x480**，
-#      640x480 在 1~1.5m 机位下头肩太小、关键点会抖 —— 所以必须显式设。
-#   取最高档的代价已实测（同一帧受控 A/B，同分辨率对照组漂移 ≤0.9%）：
-#      VIDEO 模式（程序真实模式）：1920x1080 ≈ 11.4ms  vs  1280x720 ≈ 10.5ms → 慢 7.8%
-#      IMAGE 模式（每帧全图检测）：1920x1080 ≈ 20.7ms  vs  1280x720 ≈ 19.4ms → 慢 6.5%
-#   5 FPS 的每帧预算是 200ms，1080p 只占 5.7% → **代价可忽略，最高档可以放心用**。
-DEFAULT_CAM_W = 1920
-DEFAULT_CAM_H = 1080
+# ⚠️ 采集分辨率：默认 **3840x2160（4K）+ MJPG**。2026-09-28 实测定稿。
+#
+#   当前摄像头：USB 2.0 Camera（VID_0C49&PID_636F，**标称 4K**，走 UVC）。
+#
+#   ★ 全部谜底在于**压缩格式**（用户点破"这是 4K 摄像头"后才查到的）：
+#     OpenCV/DSHOW 默认协商 **YUY2 未压缩**，而 USB 2.0 实际带宽只有 ~35MB/s：
+#       480p YUY2  = 0.6MB/帧 -> 20 FPS，100% 可靠
+#       720p YUY2  = 1.8MB/帧 -> 10 FPS，**开流成功率仅 60%**（逼近带宽极限）
+#       1080p YUY2 = 4.0MB/帧 -> 3.3 FPS，开流成功率 62%（超极限，很不稳）
+#     → **"这摄像头不行"的假象全是 YUY2 未压缩造成的**。
+#     切到 **MJPG 压缩**后（CAP_PROP_FOURCC=MJPG，且必须设在分辨率之前）：
+#       3840x2160 MJPG: **10/10 = 100% 可靠，~14 FPS**（实测一次跑到 19 FPS）
+#       2560x1440 MJPG: 10/10 = 100%，~14 FPS
+#       1080p：驱动**不提供** MJPG（强设被忽略、退回 YUY2），故 1080p 反而不可取
+#     这也解释了「为什么系统相机应用正常」：Media Foundation 会自动协商压缩格式。
+#
+#   4K 全管线实测（读帧 35.3 + cvtColor 3.0 + 推理 14.2 = **52.6ms/帧**，
+#   预算 200ms@5FPS，占 1/4）。另注：MediaPipe 输入固定 256x256，
+#   分辨率不影响姿态精度 —— 4K 的收益在「提醒现场存证照片」，不在判定。
+#
+#   代价要在意一条：`review_keep_fullres=True` 时存证照片是 4K JPEG（每张 ~1-3MB），
+#   默认上限 300 条 → 最多约 1GB。磁盘紧张就在界面关掉"存原图"。
+#
+#   历史留档（2026-09-28 早些时候的错误结论，记下来防重犯）：
+#     - 曾以为"1080p 是上限、720p 是甜点" —— 那是 YUY2 下的假象；
+#     - 曾写"480p 会把肩耳距离压到卡门槛" —— 错，门槛 0.03*min(w,h) 随分辨率缩放，
+#       余量分辨率无关（各档均 2.1~2.5x）。
+#   更早（Nebula 02 时代）：只有 MSMF 能用、固定 1080p —— 换摄像头结论完全反转，
+#   **换设备必须重测**。
+DEFAULT_CAM_W = 3840
+DEFAULT_CAM_H = 2160
+
+MJPG_FOURCC = cv2.VideoWriter_fourcc(*'MJPG') if cv2 is not None else 0
+"""UVC 压缩格式。⚠️ 必须**在设置分辨率之前** set，格式协商发生在选模式时。
+驱动若不提供 MJPG 会静默忽略（退回 YUY2）—— 那是 1080p 的情形，属正常。"""
 
 
 def find_model(name=DEFAULT_MODEL):
@@ -180,13 +231,16 @@ def find_model(name=DEFAULT_MODEL):
     )
 
 
-# ⚠️ 后端必须挨个试，不能写死。
-# 实测（2026-09-22，本机 + Nebula 02 USB 摄像头 / HP 内置头）：
-#   DSHOW 后端**一个设备都枚举不到**，只有 MSMF 能打开同一颗摄像头。
-# 复测（2026-09-26，本机只接 USB Nebula 02，VID_3AAE&PID_6373）：
-#   结论不变 —— DSHOW 按索引 0~3 全部 open 失败（"can't be used to capture by index"），
-#   MSMF / ANY 索引 0 可用，固定 1920x1080 @30fps。
-# 写死单一后端会得到"这台机器没有摄像头"的假结论——这个坑踩过一次。
+# ⚠️ 后端必须挨个试，不能写死 —— 换一颗摄像头结论就可能完全反转。
+# 历史实测（留档，说明"不能写死"这条为什么重要）：
+#   2026-09-22 / 09-26（Nebula 02, VID_3AAE&PID_6373）：
+#       DSHOW 按索引 0~3 全部 open 失败，只有 MSMF 能打开，固定 1920x1080。
+#   2026-09-28（新摄像头 USB 2.0 Camera, VID_0C49&PID_636F）：
+#       结论**完全反转** —— DSHOW 能开；MSMF 的 grab 报 E_PENDING，
+#       且 **`cv2.VideoCapture()` 构造函数本身就无限阻塞**（全新进程单独
+#       构造也复现，不是被前面的开合搞坏的状态）。
+# 所以顺序只能作为"优先猜测"，真正决定用哪个必须靠**能否读到有效帧**；
+# 会阻塞的后端则必须靠**子进程探测**排除（见 backend_viable_subprocess）。
 BACKENDS = []
 
 
@@ -219,17 +273,229 @@ def read_frame(cap):
     return True, frame
 
 
+def read_frame_timed(cap, timeout=2.5):
+    """带**超时保护**的读帧，返回 (ok, frame, timed_out)。
+
+    ⚠️ 为什么普通 try/except 不够：
+      实测本机 MSMF 后端 grab 失败后（Error: -2147483638 / E_PENDING），
+      cap.read() 会**阻塞数分钟不返回**。这是 C 层阻塞，try/except 抓不住，
+      只会让整个程序（含 GUI 线程）永久卡死。
+      所以探测阶段必须用工作线程 + join 超时兜住。
+
+    卡住的线程是 daemon，不会阻止进程退出；但它持有的设备句柄要到
+    cap.release() 才释放，因此调用方仍需负责 release。
+    """
+    box = {}
+
+    def _rd():
+        try:
+            ok, fr = cap.read()
+            box["r"] = (ok, fr)
+        except Exception:
+            box["r"] = (False, None)
+
+    th = threading.Thread(target=_rd, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return False, None, True        # 卡住，视为不可用
+    ok, fr = box.get("r", (False, None))
+    if not ok or fr is None:
+        return False, None, False
+    return True, fr, False
+
+
+def frame_is_usable(frame, min_max_pixel=8):
+    """判断一帧是否**真的有画面**（而不只是"读到了"）。
+
+    ⚠️ 这是 2026-09-28 踩出来的坑，务必保留：
+       cap.read() 返回 ok=True **不代表画面有效**。
+       实测本机 USB 2.0 Camera（VID_0C49&PID_636F）在它不支持的档位下：
+         · read() 返回 True
+         · frame.shape 正常（如 1080x1920x3）
+         · 但**内容全是 0**（frame.max() == 0），且每帧耗时精确 1000ms
+       这是驱动"接受了格式协商但填不进数据"的占位行为。
+       只判 ok 就会选中这个组合，然后画面全黑、判定逻辑对着黑图跑。
+
+    判据用 max() 而非 mean()：只要有一个像素非零就说明有真实数据流，
+    避免把"画面确实很暗"的正常情况误判成故障。
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    try:
+        return int(frame.max()) >= min_max_pixel
+    except Exception:
+        return False
+
+
+def warmup_budget(width=None, height=None):
+    """该分辨率档位允许的"全零预热帧"上限（实测值 + 余量）。
+
+    ⚠️ 为什么要按档位区分（2026-09-28 实测的逐帧序列）：
+       好的开流前几帧也是全零的，档位越高越多：
+         640x480   : 首帧就出图        -> 0 帧预热
+         1280x720  : 第 1 帧出图       -> 1 帧预热
+         1920x1080 : 第 3 帧才出图     -> 3 帧预热
+       而**坏开流**的帧是每 1000ms 一张全零（掉帧占位）。
+       所以这个上限既是"别误杀好开流"的下界，也是"别在坏开流上白等"的上界：
+       一刀切设 4（为了兼容 1080p）会让 720p 的每次坏开流白等 4s 而不是 2s，
+       实测把启动耗时从 ~4s 拖到 ~10s。故按档位给值。
+    """
+    h = height or DEFAULT_CAM_H
+    return 4 if h > 900 else 2
+
+
+def wait_usable_frame(cap, tries=5, timeout=2.5, blank_abort=None):
+    """连续读若干帧，只要有一帧**有效**就返回它。
+
+    为什么要多试几帧：UVC 摄像头开流最初几帧常是空的（曝光/白平衡未就绪），
+    只读一帧容易把好设备误判成坏设备。
+
+    ⚠️ blank_abort 的取值有实测依据，**不能一刀切**（2026-09-28 两次踩坑）：
+       本机 USB 2.0 Camera 的"**好的**开流"前几帧也是全零的，档位越高越多：
+         640x480 : 首帧就出图（0 帧预热）
+         1280x720: 第 1 帧出图（1 帧预热）
+         1920x1080: 第 3 帧出图（**3 帧预热**）
+       · 设成 2 的坑：1080p 的每个好开流都在第 2 帧被误杀，
+         表现为"1080p 重试四次全失败"，其实设备完好。
+       · 一刀切设 4 的坑：兼容了 1080p，却让 720p 的每次**坏**开流
+         白等 4×1000ms（坏帧就是 1000ms 一张），启动被拖慢一倍以上。
+       → 所以默认交给 warmup_budget(档位) 按需取值，别写死。
+
+    另：坏开流的帧是每 1000ms 一张全零（掉帧占位），好开流预热后
+    会骤降到 ~50ms(480p) / ~100ms(720p) / ~305ms(1080p)。
+    耗时无法用来提前判别（好开流首帧同样要等 1000ms），只能靠帧数。
+
+    返回 (ok, frame, stats)；stats 带诊断信息，供报错时说明失败类型。
+    """
+    if blank_abort is None:
+        blank_abort = warmup_budget()
+    last = None
+    timed_out = False
+    blank_run = 0
+    for i in range(tries):
+        ok, fr, to = read_frame_timed(cap, timeout)
+        if to:
+            timed_out = True
+            break
+        if ok:
+            last = fr
+            if frame_is_usable(fr):
+                return True, fr, {"tries": i + 1, "max_pixel": int(fr.max()),
+                                  "timed_out": False}
+            blank_run += 1
+            if blank_abort and blank_run >= blank_abort:
+                break      # 预热帧数已超上限仍全零 -> 这轮开流是坏的
+    mp = int(last.max()) if last is not None else -1
+    return False, last, {"tries": tries, "max_pixel": mp, "timed_out": timed_out}
+
+
+MAX_OPEN_ATTEMPTS = 5
+"""同一 (后端, 索引, 分辨率) 组合最多重开几次。
+
+⚠️ 为什么需要重开而不是简单重读帧（2026-09-28 实测）：
+   本机 USB 2.0 Camera（VID_0C49&PID_636F）**开流有失败率**，但这不是
+   "档位不支持" —— 同一档位重开就能好。实测各档成功率（每档 8 轮独立开合）：
+     640x480   8/8 = 100%
+     1280x720  4~5/8 ≈ 50~62%
+     1920x1080 5/8 = 62%
+   所以重读同一句柄没用（那一轮开流本身就是坏的），必须**换新句柄重开**。
+
+   取 5 次是权衡：按单次成功率 50%（保守估计）算，
+     3 次 -> 87.5%，4 次 -> 93.8%，5 次 -> 96.9%
+   再往上加，收益变小而最坏启动耗时线性增长（每次坏尝试约 4s，
+   见 wait_usable_frame 的 blank_abort），所以停在 5。
+"""
+
+OPEN_PROBE_TIMEOUT = 8.0
+"""回退后端探测的超时（秒）。见 backend_viable_subprocess()。
+
+⚠️ 为什么用**子进程**而不是线程超时：
+   某些后端的 `cv2.VideoCapture()` **构造函数本身会无限阻塞**（实测 MSMF），
+   而这是 C 层阻塞 —— 线程 join 超时救不回来（那个线程会永远卡住并攥着设备）。
+   子进程可以被硬杀，是唯一可靠的办法。
+
+⚠️ 为什么**不能**"在工作线程里创建、再交给别的线程用"（2026-09-28 实测的 2x2 对照）：
+   每格 5 轮、各自独立进程，1280x720 DSHOW：
+       创建线程    读取线程    成功率
+       主线程      主线程      4/5 = 80%
+       主线程      工作线程    3/5 = 60%
+       **工作线程  主线程      0/5 = 0%**
+       **工作线程  工作线程    0/5 = 0%**
+   DSHOW 走 COM，cap 绑定创建它的线程的 COM 单元；创建线程一结束，cap 就是死的。
+   **结论：创建必须发生在真正要用它的那个线程里。**
+   （读取线程则无所谓 —— C1/C2 都在 60~80% 区间，说明读取可跨线程。）
+
+所以：**主路径在调用线程直接创建**（不套线程），只有回退到"可疑后端"时才先
+用子进程探一下可用性，避免主进程被卡死。
+"""
+
+_BACKEND_VIABLE_CACHE = {}
+
+
+def backend_viable_subprocess(name, index, width, height, timeout=None):
+    """在**子进程**里验证 (后端, 索引, 分辨率) 能否读到有效画面。
+
+    返回 True/False。子进程超时（即构造函数或读帧阻塞）一律视为不可用，
+    并把它硬杀 —— 这样卡死的后端不会拖住主进程。
+    结果按 (name,index,width,height) 缓存，避免重复开销。
+    """
+    timeout = timeout if timeout is not None else OPEN_PROBE_TIMEOUT
+    key = (name, index, width, height)
+    if key in _BACKEND_VIABLE_CACHE:
+        return _BACKEND_VIABLE_CACHE[key]
+
+    code = (
+        "import cv2, sys\n"
+        f"cap = cv2.VideoCapture({index}, cv2.CAP_{name})\n"
+        "if not cap.isOpened():\n"
+        "    print('NO'); sys.exit(0)\n"
+        f"cap.set(cv2.CAP_PROP_FRAME_WIDTH, {width})\n"
+        f"cap.set(cv2.CAP_PROP_FRAME_HEIGHT, {height})\n"
+        "best = 0\n"
+        "for _ in range(10):\n"
+        "    ok, fr = cap.read()\n"
+        "    if ok and fr is not None and fr.size > 0:\n"
+        "        best = max(best, int(fr.max()))\n"
+        "        if best > 8:\n"
+        "            break\n"
+        "print('YES' if best > 8 else 'NO')\n"
+    )
+    ok = False
+    try:
+        r = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True, text=True, timeout=timeout)
+        ok = "YES" in (r.stdout or "")
+    except subprocess.TimeoutExpired:
+        ok = False          # 卡住了 -> 该后端不可用（子进程已被 kill）
+    except Exception:
+        ok = False
+    _BACKEND_VIABLE_CACHE[key] = ok
+    return ok
+
+
 def open_camera(idx=None, backend=None, width=None, height=None):
     """打开摄像头。
 
     索引、后端、分辨率**都**不可靠，逐个组合尝试：
       - 索引：接多个摄像头时 0 未必是想要的那颗
-      - 后端：DSHOW 与 MSMF 能看到的设备集合可能完全不同（实测差异极大）
-      - 分辨率：不显式设置时 OpenCV 往往只给 640x480；但**有些后端设了反而打不开流**
-        （两端实测结论相反：笔记本上 MSMF 报 "Failed to select stream 0"、DSHOW 正常给 720p；
-         本机 USB Nebula 02 恰相反 —— DSHOW 完全打不开、MSMF 固定给 1080p。
-         所以只能挨个组合试，不能写死。）
-    所以先按请求分辨率试一轮，全失败再退到"不设分辨率"兜底一轮。
+      - 后端：别人机器上的结论**不能照搬**。实测同一台机器换颗摄像头就反转：
+          Nebula 02 时代只有 MSMF 能开、DSHOW 全废；
+          换成 USB 2.0 Camera 后 DSHOW 能开、MSMF 连构造函数都会阻塞。
+        所以顺序只作"优先猜测"，真正决定用哪个必须靠能否读到有效帧。
+      - 分辨率：不显式设置时 OpenCV 往往只给 640x480；但设了**有时反而打不开流**。
+        所以先按请求分辨率试一轮，全失败再退到"不设分辨率"兜底一轮。
+
+    ⚠️ 三层坑，都在这里兜住：
+      ① **能打开 ≠ 有画面**：开流可能返回 ok=True 但内容全零的占位帧
+         （见 frame_is_usable），此时要**换新句柄重开**（见 MAX_OPEN_ATTEMPTS）。
+      ② **创建必须在调用线程**：DSHOW 是 COM，cap 绑定创建它的线程；
+         在工作线程创建再交给别人用 = 拿到废句柄（实测 0/5，见 OPEN_PROBE_TIMEOUT 的文档）。
+      ③ **构造函数可能阻塞**：所以回退到可疑后端前，先用**子进程**探一下
+         （可硬杀），避免主进程永久卡死。
+
+    重试按"**轮次**"组织而不是"把某个组合试到底"：每一轮都让所有还活着的
+    后端各试一次。这样首选后端每轮都有机会，可疑后端最多各付一次探测代价就被跳过。
     """
     _need_cv()
     bts = _build_backends()
@@ -239,77 +505,209 @@ def open_camera(idx=None, backend=None, width=None, height=None):
     w_req = width or DEFAULT_CAM_W
     h_req = height or DEFAULT_CAM_H
 
+    blank_tried = []        # 「能打开但画面无效」的组合，用于最后把报错说清楚
+    skipped = set()         # 子进程判定不可用 / 会阻塞的后端
+    absent = set()          # (后端, 索引) 确认设备不在，不必反复开
+    preferred = bts[0][0] if bts else None   # 首选后端：直接试，不做子进程探测
+
     for res in ((w_req, h_req), (None, None)):
-        for name, be in bt:
-            for i in indices:
-                cap = cv2.VideoCapture(i, be)
-                if not cap.isOpened():
-                    cap.release()
+        for attempt in range(MAX_OPEN_ATTEMPTS):
+            for name, be in bt:
+                if name in skipped:
                     continue
-                if res[0]:
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, res[0])
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res[1])
-                ok, frame = read_frame(cap)
-                if ok:
-                    h, w = frame.shape[:2]
-                    note = ""
-                    if res[0] and (w, h) != (w_req, h_req):
-                        note = f"（请求 {w_req}x{h_req}，该组合不支持，已用实际值）"
-                    elif res[0] is None:
-                        note = "（请求分辨率会打不开流，已退回默认）"
-                    print(f"[摄像头] 后端={name} 索引={i} 分辨率={w}x{h}{note}")
-                    return cap, i
-                cap.release()
+                for i in indices:
+                    if (name, i) in absent:
+                        continue
+                    # 非首选后端先做子进程可用性探测（防构造函数卡死）
+                    if name != preferred:
+                        if not backend_viable_subprocess(
+                                name, i, res[0] or w_req, res[1] or h_req):
+                            blank_tried.append(
+                                (name, i, res, {"max_pixel": -1, "timed_out": True}))
+                            skipped.add(name)
+                            break
+                    # ★ 在**调用线程**里创建（见 OPEN_PROBE_TIMEOUT 的 2x2 实测）
+                    cap = cv2.VideoCapture(i, be)
+                    if not cap.isOpened():
+                        cap.release()
+                        absent.add((name, i))
+                        continue
+                    if res[0]:
+                        # ⚠️ FOURCC 必须先于分辨率设置 —— 格式协商发生在选模式时。
+                        #    MJPG 是 USB 2.0 上跑高分辨率的唯一出路（YUY2 未压缩
+                        #    在 720p 就开始挤带宽极限，开流成功率掉到 60%）。
+                        #    驱动不支持该档的 MJPG 时会静默忽略，属正常。
+                        cap.set(cv2.CAP_PROP_FOURCC, MJPG_FOURCC)
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, res[0])
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res[1])
+                    # ⚠️ 必须判「有效帧」，不能只判 ok（见 frame_is_usable 文档）
+                    #    预热容限按档位给（见 warmup_budget），否则要么误杀好开流、
+                    #    要么在坏开流上白等。
+                    ok, frame, stat = wait_usable_frame(
+                        cap, blank_abort=warmup_budget(*res) if res[0] else None)
+                    if ok:
+                        h, w = frame.shape[:2]
+                        note = ""
+                        if res[0] and (w, h) != (w_req, h_req):
+                            note = f"（请求 {w_req}x{h_req}，该组合不支持，已用实际值）"
+                        elif res[0] is None:
+                            note = "（请求分辨率会打不开流，已退回默认）"
+                        retry = f"（第 {attempt + 1} 轮开流才拿到画面）" if attempt else ""
+                        print(f"[摄像头] 后端={name} 索引={i} 分辨率={w}x{h}{note}{retry}")
+                        return cap, i
+                    cap.release()
+                    if stat["timed_out"]:
+                        # read 层面阻塞，同样认定该后端不可用
+                        blank_tried.append((name, i, res,
+                                            {"max_pixel": -1, "timed_out": True}))
+                        skipped.add(name)
+                        break
+                    # 全零帧 -> 记下来；还会在下一轮换新句柄重开
+                    if attempt == MAX_OPEN_ATTEMPTS - 1:
+                        blank_tried.append((name, i, res, dict(stat)))
+            if not [(n, b) for (n, b) in bt if n not in skipped]:
+                break
+        # end attempts
+    # 报错要把"打开成功但画面无效"的情况单独说清楚 —— 这跟"打不开"是两种病，
+    # 处置完全不同（一个是占用/驱动，另一个是流开了但拿不到数据）。
+    hint = ""
+    if blank_tried:
+        lines = []
+        seen = set()
+        for nm, i, res, stat in blank_tried:
+            rs = f"{res[0]}x{res[1]}" if res and res[0] else "默认"
+            key = (nm, rs, bool(stat.get("timed_out")))
+            if key in seen:
+                continue
+            seen.add(key)
+            if stat.get("timed_out"):
+                why = "该后端阻塞/不可用（已用子进程探测排除）"
+            elif stat["max_pixel"] == 0:
+                why = "画面全零（流开了但拿不到数据）"
+            else:
+                why = f"画面异常（最大像素 {stat['max_pixel']}）"
+            lines.append(f"    后端={nm} 索引={i} 请求={rs} -> {why}")
+        hint = ("\n\n⚠️ 以下组合**能打开设备但读不到有效画面**：\n"
+                + "\n".join(lines[:8])
+                + f"\n  若为「画面全零」：已自动重开 {MAX_OPEN_ATTEMPTS} 轮仍失败，"
+                  "说明该档位确实取不到画面，\n"
+                  "    换低一档（如 640x480）再试 —— 用 `--list-cameras` 看哪些档位 ✅。"
+                  "\n  若为「该后端阻塞/不可用」：换 `--backend DSHOW` 试另一个后端。")
+
     sys.exit(
-        "打不开任何摄像头。排查顺序：\n"
-        "  1) 是否被别的程序占用（相机 App / 会议软件 / 浏览器标签页）\n"
-        "  2) 隐私设置是否禁止桌面应用访相机\n"
+        "打不开任何摄像头（没有能读到**有效画面**的组合）。排查顺序：\n"
+        "  1) 分辨率档位是否超出设备能力 —— 换 `--width 640 --height 480` 试\n"
+        "  2) 是否被别的程序占用（相机 App / 会议软件 / 浏览器标签页）\n"
+        "  3) 隐私设置是否禁止桌面应用访相机\n"
         "     Windows 设置 > 隐私和安全性 > 相机 > 允许桌面应用访问\n"
-        "  3) USB 线接触不良 / 供电不足（换口试，优先主板直连口）\n"
-        "  4) 用 --list-cameras 看看系统到底认到了什么"
+        "  4) USB 线接触不良 / 供电不足（换口试，优先主板直连口）\n"
+        "  5) 用 --list-cameras 看系统到底认到了什么（它会标注每档是否真有画面）"
+        + hint
     )
 
 
 def list_cameras(width=None, height=None):
-    """列出所有能打开的组合——排查阶段先用这个。
+    """列出所有能打开的组合，并**逐档位标注是否真有画面**。
 
-    同时报告「默认给的分辨率」与「请求 720p 后的实际分辨率」，两者的差值就是这个坑。
+    ⚠️ 2026-09-28 重写，两个原因：
+      1) 原实现只判 `cap.read()` 的 ok，会把"能打开但只返回全零占位帧"的
+         档位报成「✅ 实际 1920x1080」—— 实测这颗 USB 2.0 摄像头在 1080p
+         下正是如此，排查时被这个假 ✅ 带偏，误以为摄像头正常。
+      2) 原实现慢到不可用（一次枚举 200s+ 还没输出）。
+
+    现在：每档独立开合设备（同进程连续 set 会互相污染），逐档验证**有效画面**，
+    连续多帧全零则提前判死，并且所有输出立即 flush（否则重定向到文件时看不到）。
     """
     _need_cv()
-    w_req = width or DEFAULT_CAM_W
-    h_req = height or DEFAULT_CAM_H
-    print(f"枚举摄像头（后端 × 索引），并尝试把分辨率拉到 {w_req}x{h_req} ...\n")
-    hits = []
-    for name, be in _build_backends():
-        for i in range(4):
-            cap = cv2.VideoCapture(i, be)
-            if cap.isOpened():
-                ok0, f0 = read_frame(cap)
-                default = f"{f0.shape[1]}x{f0.shape[0]}" if ok0 else "读不到帧"
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w_req)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h_req)
-                ok, frame = read_frame(cap)
-                if ok:
-                    h, w = frame.shape[:2]
-                    gain = "" if default == f"{w}x{h}" else f"   （默认只有 {default}，已提升）"
-                    print(f"  ✅ 后端={name:6s} 索引={i}  实际 {w}x{h}{gain}")
-                    hits.append((name, i, w, h))
-                else:
-                    tips = "改分辨率后流打不开（属正常，用别的后端/索引即可）" \
-                        if default != "读不到帧" else "打开成功但读不到帧（多半被占用）"
-                    print(f"  ⚠️ 后端={name:6s} 索引={i}  {tips}")
-            cap.release()
-    print()
-    if not hits:
-        print("未发现可用摄像头。")
+
+    def say(s=""):
+        print(s, flush=True)
+
+    say("枚举摄像头：后端 × 索引 × 分辨率档位（每档都验证是否真有画面）")
+    say("说明：⚠️全零 = 该档位固件不支持；超时 = 该后端不可用；打不开 = 设备不在")
+    say()
+
+    # 待测档位：用户显式指定则只测它，否则按像素数自高到低扫一遍
+    if width and height:
+        tiers = [(width, height)]
     else:
-        best = max(hits, key=lambda x: x[2] * x[3])
-        print(f"共 {len(hits)} 个可用组合。多后端同一设备属正常（同一颗摄像头被多后端都能打开）。")
-        print(f"最高分辨率：{best[2]}x{best[3]}（后端={best[0]} 索引={best[1]}）")
-        if best[2] * best[3] < 1280 * 720:
-            print("⚠️ 没能拿到 720p。低分辨率下 1~1.5m 机位的关键点会明显抖动，")
-            print("   请确认摄像头本身支持更高档位，或把机位拉近一点。")
-        print("在 --camera 参数里用索引即可；若同一索引不同后端行为不一致，用 --backend 指定。")
+        tiers = [(3840, 2160), (2560, 1440), (1920, 1080), (1600, 1200),
+                 (1280, 960), (1280, 720), (1024, 768), (800, 600), (640, 480)]
+
+    usable = []
+    dead_backends = set()
+    preferred = _build_backends()[0][0] if _build_backends() else None
+    for name, be in _build_backends():
+        if name in dead_backends:
+            say(f"  后端={name}  跳过（前面已测出该后端会阻塞）")
+            continue
+        # ⚠️ 非首选后端先做子进程可用性探测。
+        #    本机 MSMF 的构造函数会**无限阻塞**，直接开会让 --list-cameras
+        #    永久挂住 —— 而它正是文档里推荐的第一步排查手段，挂住最要命。
+        #    子进程可被硬杀，见 backend_viable_subprocess 的文档。
+        if name != preferred:
+            probe = backend_viable_subprocess(name, 0, tiers[0][0], tiers[0][1])
+            if not probe:
+                say(f"  后端={name}  跳过（子进程探测不可用/会阻塞）")
+                dead_backends.add(name)
+                say()
+                continue
+        any_index_open = False
+        for i in range(3):
+            printed_head = False
+            for (w, h) in tiers:
+                cap = cv2.VideoCapture(i, be)
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                if not printed_head:
+                    say(f"  后端={name}  索引={i}")
+                    printed_head = True
+                    any_index_open = True
+                # 先 MJPG 后分辨率（同 open_camera；驱动不支持的档会静默忽略）
+                cap.set(cv2.CAP_PROP_FOURCC, MJPG_FOURCC)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                ok, frame, stat = wait_usable_frame(
+                    cap, tries=3, timeout=2.0, blank_abort=warmup_budget(w, h))
+                if ok:
+                    ah, aw = frame.shape[:2]
+                    note = "" if (aw, ah) == (w, h) else f"（实得 {aw}x{ah}）"
+                    say(f"    {w:>4}x{h:<4} ✅ 有画面  最大像素={stat['max_pixel']:>3}{note}")
+                    usable.append((name, i, aw, ah))
+                elif stat["timed_out"]:
+                    say(f"    {w:>4}x{h:<4} ⚠️ 后端阻塞超时（该后端不可用，跳过）")
+                    cap.release()
+                    dead_backends.add(name)
+                    break
+                elif stat["max_pixel"] == 0:
+                    say(f"    {w:>4}x{h:<4} ⚠️ 全零（该档位固件不支持）")
+                elif stat["max_pixel"] > 0:
+                    say(f"    {w:>4}x{h:<4} ⚠️ 画面异常（最大像素 {stat['max_pixel']}）")
+                else:
+                    say(f"    {w:>4}x{h:<4} ⚠️ 读不到帧（可能被占用）")
+                cap.release()
+            if printed_head:
+                say()
+        if not any_index_open:
+            say(f"  后端={name}  未枚举到设备")
+            say()
+
+    if not usable:
+        say("未发现任何能读到**有效画面**的组合。")
+        say("按上面的失败类型排查：全零=换档位；超时=换后端；打不开=查占用与隐私设置。")
+        return
+
+    best = max(usable, key=lambda x: x[2] * x[3])
+    say(f"可用组合 {len(usable)} 个（同一摄像头被多后端枚举到属正常）。")
+    say(f"最高可用档位：{best[2]}x{best[3]}（后端={best[0]} 索引={best[1]}）")
+    if best[2] * best[3] < 1280 * 720:
+        say("⚠️ 没能拿到 720p。低分辨率下 1~1.5m 机位的关键点会明显抖动，")
+        say("   建议把机位拉近，或换一颗支持 720p 以上的摄像头。")
+    say()
+    say("在 --camera 参数里用索引即可；若同一索引不同后端行为不一致，用 --backend 指定。")
+    say(f"本项目默认档位由 DEFAULT_CAM_W/H 决定，当前为 {DEFAULT_CAM_W}x{DEFAULT_CAM_H}；")
+    say("若默认档位不在上面的 ✅ 列表里，用 --width/--height 显式指定一个 ✅ 的值。")
 
 
 # ---------------------------------------------------------------- 正面指标

@@ -231,6 +231,8 @@ posture_engine.py    后台线程引擎      ← 采集+推理+判定+迟滞+语
 posture_app.py       PySide6 图形界面  ← 只画界面
 ```
 
+（上框里"60 个离线用例"是本文档写作时的规模；用例数后续已增至 145，现况见 `README.md`）
+
 **为什么必须分层**：迟滞逻辑（连续 4 秒才提醒）如果 CLI 写一遍、GUI 再写一遍，
 两条路径迟早漂移——而这恰好是最容易毁掉产品的参数。所以抽成 `ReminderGate` 共用。
 同理，`sanity_rows()` 也做成返回结构化结果，CLI 打印、GUI 上色都用它。
@@ -418,4 +420,4 @@ MCI 只作 mp3 的兜底通道。
 
 *本文档对应代码版本：纯侧面 `--side-only` / `--side-yaw`；修复角度宽高比、读帧异常、分辨率、躯干符号、时间戳；
 新增 `sh_ear_len` 指标；抽出 `ReminderGate` 共用迟滞；新增 `posture_engine.py`（线程引擎）与
-`posture_app.py`（PySide6 图形界面）；`tests/test_offline.py` 103 用例全通过。*
+`posture_app.py`（PySide6 图形界面）；`tests/test_offline.py` 103 用例全通过（当时）。*
