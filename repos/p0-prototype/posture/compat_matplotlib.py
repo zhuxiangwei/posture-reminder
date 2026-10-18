@@ -29,14 +29,13 @@ mediapipe 的视觉得分链是**硬导入**：
     .../vision/drawing_utils.py:21
         -> import matplotlib.pyplot as plt      # 无条件，就是这里炸
 
-于是 `mediapipe.tasks.python.vision` 整包导入失败，
-`posture_monitor.py` 里 `vision` 退化成 None，最终报出
-`AttributeError: 'NoneType' object has no attribute 'PoseLandmarker'`
+于是 `mediapipe.tasks.python.vision` 整包导入失败，`posture.deps.vision` 退化成 None，
+最终报出 `AttributeError: 'NoneType' object has no attribute 'PoseLandmarker'`
 —— 一个和真实病因毫无关系的报错。
 
 ================================================================ 为什么可以安全打桩
 
-`matplotlib` 在 mediapipe 里**只被 used 于一个 3D 调试可视化函数**
+`matplotlib` 在 mediapipe 里**只被用于一个 3D 调试可视化函数**
 （`drawing_utils.plot_landmarks`，用到 plt.figure / plt.axes / plt.show）。
 **推理管线完全不碰 matplotlib**，本项目代码也 0 处引用它（全仓 grep 确认）。
 
@@ -45,9 +44,9 @@ mediapipe 的视觉得分链是**硬导入**：
 
 ================================================================ 用法
 
-在**导入 mediapipe 之前**调用 install()：
+由 `posture.deps` 在导入 mediapipe **之前**自动调用；手工用则：
 
-    import compat_matplotlib
+    from posture import compat_matplotlib
     compat_matplotlib.install()
 
     import mediapipe            # 此后才能成功
@@ -140,6 +139,6 @@ def stub_active():
     return bool(m is not None and getattr(m, "__version__", "") == "0.0.0+compat-stub")
 
 
-# 顺手兜住 `import compat_matplotlib` 之后直接 `from matplotlib import pyplot`
-# 这种写法：不装桩，保持惰性，由调用方显式 install()。
+# 顺手兜住 `from posture import compat_matplotlib` 之后直接
+# `from matplotlib import pyplot` 这种写法：不装桩，保持惰性，由调用方显式 install()。
 __all__ = ["install", "stub_active"]

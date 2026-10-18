@@ -18,8 +18,11 @@ review/
 # ----------------------------------------------------------------
 # config.json   记着摄像头索引、家长调过的阈值
 # baseline.json 是**孩子本人**的坐姿基线（跟着机位和体型走，换台机器就没意义）
+# camera_profile.json 是本机探测结果（哪颗摄像头哪个档位有画面、哪个后端会卡死），
+#                     换台机器就是废数据，还会把新机器带偏 —— 同样只留本机。
 repos/p0-prototype/config.json
 repos/p0-prototype/baseline.json
+repos/p0-prototype/camera_profile.json
 
 # ----------------------------------------------------------------
 # 🟠 第三类：体积大的可再生产物
