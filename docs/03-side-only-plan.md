@@ -170,6 +170,9 @@ envs\posture\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu
 # ② 排查第一步：认到几颗摄像头
 envs\posture\Scripts\python.exe repos\p0-prototype\posture_monitor.py --list-cameras
 
+# ②' 「加载很久」验收：连续开关 12 次（中位 ≤8s、p95 ≤15s；低于请求档会打 ⚠️ 降档）
+envs\posture\Scripts\python.exe repos\p0-prototype\posture_monitor.py --bench-open 12
+
 # ③ 性能自测 —— 必须让人坐在摄像头前，否则数字偏乐观 40%
 envs\posture\Scripts\python.exe repos\p0-prototype\posture_monitor.py --bench --bench-frames 100
 
@@ -224,14 +227,19 @@ envs\posture\Scripts\python.exe repos\p0-prototype\posture_monitor.py --side-onl
 ### 8.1 分层（关键：判定逻辑只有一份）
 
 ```
-posture_monitor.py   判定逻辑 + CLI    ← 纯数学，60 个离线用例锁着
+posture/metrics.py     指标与判定 + CLI    ← 纯数学，离线用例锁着
       ↑  共用（ReminderGate / judge_side / sanity_rows）
-posture_engine.py    后台线程引擎      ← 采集+推理+判定+迟滞+语音
+posture/camera.py      采集线程 CameraStream ← 开流/档位/预算/掉线重连（2026-10-18 起）
+      ↑  最新帧 + 实况
+posture/engine.py      后台线程引擎        ← 推理+判定+迟滞+语音
       ↑  快照 / 指令
-posture_app.py       PySide6 图形界面  ← 只画界面
+posture/ui/*           PySide6 图形界面     ← 只画界面
 ```
 
-（上框里"60 个离线用例"是本文档写作时的规模；用例数后续已增至 145，现况见 `README.md`）
+（本文档写作时这三层是 `posture_monitor.py` / `posture_engine.py` / `posture_app.py` 三个
+单文件；2026-10-18 重构后实现搬进 `posture/` 包，那三个文件只剩转发壳。
+分层理由不变，反而多了一层：**设备的归属单独成模块**，界面与引擎都不许自己开流。
+用例数现况见 `README.md`。）
 
 **为什么必须分层**：迟滞逻辑（连续 4 秒才提醒）如果 CLI 写一遍、GUI 再写一遍，
 两条路径迟早漂移——而这恰好是最容易毁掉产品的参数。所以抽成 `ReminderGate` 共用。
@@ -239,6 +247,14 @@ posture_app.py       PySide6 图形界面  ← 只画界面
 
 **为什么引擎必须独立线程**：单帧推理约 20ms、采样 5 FPS 看着不重，
 但 `cap.read()` 会阻塞，标定阶段还要连跑 10 秒——放 UI 线程里界面会在最关键时刻卡死。
+
+⚠️ 2026-10-18 补一条：**光是"独立线程"还不够**。重构前引擎线程里同时干两件事
+（开流 + 读帧推理），于是开流的 5~20s 里引擎无法响应、`cap.read()` 一阻塞整条循环就僵、
+USB 掉线后**没有任何恢复路径**（画面停在最后一帧，看着还在跑）。
+现在设备的归属单独成一层：`posture/camera.py` 的 `CameraStream` 自己一条**长命线程**
+（DSHOW 走 COM，句柄绑创建线程 —— 实测跨线程创建 0/5 全废），
+引擎只"取最新帧 → 推理 → 判定"，并通过 `snapshot()["cam"]` 把
+`opening / ready / reconnecting / failed` 与**降档警告**实时报给界面。
 
 ### 8.2 界面设计（依据报告 §8）
 
@@ -421,3 +437,8 @@ MCI 只作 mp3 的兜底通道。
 *本文档对应代码版本：纯侧面 `--side-only` / `--side-yaw`；修复角度宽高比、读帧异常、分辨率、躯干符号、时间戳；
 新增 `sh_ear_len` 指标；抽出 `ReminderGate` 共用迟滞；新增 `posture_engine.py`（线程引擎）与
 `posture_app.py`（PySide6 图形界面）；`tests/test_offline.py` 103 用例全通过（当时）。*
+
+*2026-10-18 更新：实现搬进 `posture/` 包（`posture_*.py` 只剩转发壳）；摄像头独立成
+`posture/camera.py`（构造期协商 + 15s 预算与准入闸 + 子进程探测与 profile 记忆 +
+`CameraStream` 采集线程与掉线自动重连）；离线用例 **298** 个、界面冒烟 **26** 项；
+开流实测中位 10.6s → **1.7~3.7s**（两批共 18 轮连续开关：0 失败、0 降档）。本文的判定/机位/审核结论不受影响。*

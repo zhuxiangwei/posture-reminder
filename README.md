@@ -3,7 +3,7 @@
 给家里的小学生做的**桌面坐姿提醒**：一颗摄像头侧放在孩子旁边监测坐姿，
 连续歪着超过几秒就用语音提醒一句，坐正了完全不打扰。
 
-**v1.0.0**　·　Windows　·　全程本地推理，画面不上传
+**v1.1.0**　·　Windows　·　全程本地推理，画面不上传
 
 ---
 
@@ -171,16 +171,32 @@ posture-reminder/
 │   └── make_voice.py              生成语音片段（edge-tts → wav）
 ├── bench/models/                  模型权重（不入库）
 └── repos/p0-prototype/
-    ├── posture_monitor.py         判定逻辑 + 命令行
-    ├── posture_engine.py          后台线程引擎（采集+推理+判定+迟滞+语音）
-    ├── posture_app.py             PySide6 图形界面
-    ├── tests/test_offline.py      156 个离线用例（不需要摄像头）
+    ├── posture/                   ★ 实现全在这里
+    │   ├── camera.py              摄像头子系统（开流/档位/预算/探测/采集线程/自动重连）
+    │   ├── metrics.py             指标与判定（正面/侧面/融合/基线/阈值建议）
+    │   ├── gate.py                迟滞与提醒间隔（CLI 与 GUI 共用一份实现）
+    │   ├── engine.py              后台线程引擎（采集→推理→判定→迟滞→提醒）
+    │   ├── settings.py            配置与基线读写（基线按实际采集档校验）
+    │   ├── pose.py / voice.py     姿态推理封装 / 语音播放
+    │   ├── review.py / logutil.py 审核样本存储 / 运行日志落盘
+    │   ├── deps.py / paths.py     依赖延迟导入 / 路径唯一来源
+    │   ├── cli.py                 命令行（--list-cameras / --bench / --bench-open / --video）
+    │   └── ui/                    PySide6 界面（theme/widgets/main_window/
+    │                              parent_dialog/review_panel/selftest）
+    ├── posture_app.py             图形界面入口（薄壳 → posture.app.main）
+    ├── posture_monitor.py         命令行入口（薄壳 → posture.cli.main）
+    ├── posture_engine.py          兼容壳（老写法 pe.PostureEngine 仍可用）
+    ├── tests/test_offline.py      298 个离线用例（不需要摄像头、不需要模型）
     └── voice/                     预生成语音（7 条 wav）
 ```
 
-**三层分离**，关键理由是**迟滞规则只能有一份实现**：
-CLI 和 GUI 各写一遍的话，「连续 4 秒才提醒」这类最容易毁产品的参数迟早会漂移。
-所以抽成 `ReminderGate` 共用；推理也跑在独立线程里，否则界面会在最关键时刻卡死。
+**三层分离**，关键理由是**规则只能有一份实现**：
+CLI 和 GUI 各写一遍的话，「连续 4 秒才提醒」这类最容易毁产品的参数迟早会漂移 ——
+所以抽成 `ReminderGate` 共用；摄像头同理，只有一处能开流，那就是 `camera.CameraStream`。
+推理也跑在独立线程里，否则界面会在最关键时刻卡死。
+
+仓库根那三个 `posture_*.py` 在 2026-10-18 重构后**只剩转发**（老脚本、启动器、文档示例
+里的 `pm.compute_metrics` / `pe.PostureEngine` 写法继续可用）。老模块路径的引用不用改。
 
 ---
 
@@ -193,7 +209,8 @@ CLI 和 GUI 各写一遍的话，「连续 4 秒才提醒」这类最容易毁�
 | **★ 关键：压缩格式（FOURCC）** | OpenCV/DSHOW 默认协商 **YUY2 未压缩**，而 USB 2.0 实际带宽只有 ~35MB/s：480p YUY2=0.6MB/帧→20FPS 且 100% 可靠；**720p YUY2=1.8MB/帧→开流成功率仅 60%**；**1080p YUY2=4MB/帧→3.3 FPS、62%**。切 **MJPG** 后 **4K 反而 100% 可靠**。→ 设置顺序**必须**是「先 `CAP_PROP_FOURCC=MJPG`、再设分辨率」。这也解释了**为什么系统相机应用一直正常**：Media Foundation 会自动协商压缩格式 |
 | **为什么不用 1080p** | 这颗驱动**只在高档位（4K/1440p）提供 MJPG**，1080p 请求 MJPG 会被静默忽略、退回 YUY2（于是只有 3.3 FPS、开流 62%）→ 1080p 反而不如 4K 好用 |
 | **4K 全管线耗时** | 读帧(含 MJPG 解码) 35.3 + cvtColor 3.0 + 推理 14.2 = **52.6ms/帧**，5 FPS 预算 200ms → 占 1/4。实测吞吐 19 FPS |
-| **开流会失败（防御仍在）** | 表现为**返回 ok=True 但内容全零的占位帧**（每帧固定 1000ms），**重开设备即可恢复**。程序内建重开重试（最多 5 轮）+ 有效帧判定，对低质量档位与将来换设备都是防线 |
+| **★ 开流耗时（2026-10-18 重构后实测）** | `--bench-open` 两批实测（12 连开 + 6 连开，共 18 轮）：**中位 1.7~3.7s、p95 4.9~9.2s、18/18 全部拿到 3840×2160（零降档、零失败）**。重构前同一台机器：中位 **10.6s**、最差 **48.9s**、失败后界面僵住。差距主要来自三处：属性**写进构造函数**（0.17s vs 开完再 set 的 4.46s）、profile **只排序不预检**、重试之间**不再夹子进程探测**（省掉白烧的 16s）。上限：`OPEN_BUDGET_SEC=15s` + 准入闸 `MIN_ATTEMPT_SEC=2.5s`。⚠️ **每批的第一轮最慢**（6 连开那次：首轮 9.15s／7 次尝试，其余 1 次就成）——设备刚被别的进程用过时驱动还在收尾，这属于设备状态，不在"代码能消掉"的范围；界面因此显示"已经等了 N 秒，正在试 …"，而不是让人对着黑屏猜 |
+| **开流会失败（防御仍在）** | 表现为**返回 ok=True 但内容全零的占位帧**（每帧固定 1000ms），**重开设备即可恢复**。程序内建同组合重开（最多 5 轮）+ 有效帧判定 + 总预算，对低质量档位与将来换设备都是防线。⚠️ 极快连续开关（间隔 <1s）仍会撞上占位态 —— 这是 UVC 驱动的行为，不是代码能消掉的，所以 `--bench-open` 每轮之间留 0.6s |
 | **"好的开流"前几帧也是全零** | 档位越高预热越长（480p 0 帧 / 720p 1 帧 / 1080p 3 帧）。判「有效画面」时必须容许预热帧，否则会把好开流误杀（这个坑真实踩过） |
 | **MSMF 后端不可用** | `cv2.VideoCapture(0, CAP_MSMF)` **构造函数本身无限阻塞**（全新进程单独构造也复现）。注意：Windows 相机应用（用户态 Media Foundation）正常，是 **OpenCV 该后端与设备的组合问题**，不是摄像头不能跑 MF |
 | **⚠️ 已更正的两处错误** | ① 曾写"480p 会把肩耳距离压到 32px 卡在门槛上"—— 错，门槛 `0.03×min(w,h)` **随分辨率缩放**，各档余量均 2.1~2.5x（320×240 都过筛）；② 曾写"1080p 是上限、720p 是甜点"—— 那是 **YUY2 未压缩**造成的假象，切 MJPG 后 4K 更可靠 |
@@ -207,11 +224,14 @@ CLI 和 GUI 各写一遍的话，「连续 4 秒才提醒」这类最容易毁�
 ## 开发
 
 ```bash
-:: 判定逻辑回归（145 用例，不需要摄像头、不需要模型）
+:: 判定逻辑回归（298 用例，不需要摄像头、不需要模型）
 envs\posture\Scripts\python.exe repos\p0-prototype\tests\test_offline.py
 
-:: 界面冒烟自检（17 项，离屏跑，不会闪窗）
+:: 界面冒烟自检（26 项，离屏跑，不会闪窗）
 envs\posture\Scripts\python.exe repos\p0-prototype\posture_app.py --selftest
+
+:: 「加载很久」验收：连续开关 12 次，打印中位/p95/最差/失败，低于请求档会打 ⚠️ 降档
+envs\posture\Scripts\python.exe repos\p0-prototype\posture_monitor.py --bench-open 12
 
 :: 看真实屏幕参数（HDPI 下窗口装不下时用它排查）
 envs\posture\Scripts\python.exe repos\p0-prototype\posture_app.py --screen
@@ -243,6 +263,14 @@ envs\posture\Scripts\python.exe repos\p0-prototype\posture_monitor.py --video �
   （不再需要"重跑 `--bench`"这条待办；若要复测，`--bench` 仍在）
 - [x] ~~长期挂机稳定性~~ → 已用「视频回放喂给引擎」的方式压测（见 `--video`）
 - [ ] 用 `--video` 拿真实录像复核阈值（误报/漏报都看得见，不用等现场）
+- [x] ~~摄像头子系统重构~~ → 2026-10-18 完成：实现收进 `posture/` 包，设备归一条长命采集线程
+  （`camera.CameraStream`）。三条投诉各自的根因与修法：
+  **加载很久** → 属性改在构造函数里协商（快 26×）+ 去掉预检与重复探测 + 15s 预算与准入闸，
+  实测中位 10.6s → **1.7~3.7s**（18 轮连续开关 0 失败、0 降档）；
+  **画面只有四分之一** → 缩放搬到 `paintEvent`（按当前控件尺寸 × DPR），HiDPI 下预览铺满；
+  **经常出错 / 出错看不出来** → 掉线自动重连、开流进度与**降档警告**都必须显示
+  （"坚持 4K 优先、低于请求档不许静默"），断线时统计与判定一起暂停。
+  详见 `repos/p0-prototype/README.md` 的「摄像头子系统（2026-10-18 重构）」与 `CHANGELOG.md`
 
 ---
 
